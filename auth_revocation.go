@@ -8,14 +8,16 @@ import (
 	"time"
 )
 
-// TokenRevocationStore quản lý danh sách token đã bị thu hồi (đăng xuất) trong bộ nhớ
+// TokenRevocationStore quản lý danh sách token đã bị thu hồi (đăng xuất hoặc đăng nhập thiết bị mới) trong bộ nhớ
 type TokenRevocationStore struct {
-	mu            sync.RWMutex
-	revokedHashes map[string]time.Time // sha256(token) -> expiresAt
+	mu               sync.RWMutex
+	revokedHashes    map[string]time.Time // sha256(token) -> expiresAt
+	activeUserTokens map[string]string    // username -> sha256(activeToken)
 }
 
 var globalTokenRevocationStore = &TokenRevocationStore{
-	revokedHashes: make(map[string]time.Time),
+	revokedHashes:    make(map[string]time.Time),
+	activeUserTokens: make(map[string]string),
 }
 
 func init() {
@@ -79,11 +81,32 @@ func (s *TokenRevocationStore) IsTokenRevoked(tokenStr string) bool {
 	return true
 }
 
+// SetActiveUserToken ghi nhận token mới nhất của user và tự động thu hồi token cũ (chỉ cho phép 1 thiết bị đăng nhập cùng lúc)
+func (s *TokenRevocationStore) SetActiveUserToken(username, tokenStr string, expiresAt time.Time) {
+	userKey := strings.ToLower(strings.TrimSpace(username))
+	if userKey == "" || tokenStr == "" {
+		return
+	}
+	newHash := hashToken(tokenStr)
+	if expiresAt.Before(time.Now()) {
+		expiresAt = time.Now().Add(7 * 24 * time.Hour)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if oldHash, exists := s.activeUserTokens[userKey]; exists && oldHash != "" && oldHash != newHash {
+		s.revokedHashes[oldHash] = expiresAt
+	}
+	s.activeUserTokens[userKey] = newHash
+}
+
 // Reset xóa toàn bộ danh sách thu hồi (hữu ích cho unit test)
 func (s *TokenRevocationStore) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.revokedHashes = make(map[string]time.Time)
+	s.activeUserTokens = make(map[string]string)
 }
 
 // cleanup dọn dẹp các token đã hết hạn

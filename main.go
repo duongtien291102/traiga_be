@@ -728,6 +728,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Thu hồi phiên đăng nhập cũ của cùng tài khoản (chỉ cho phép 1 thiết bị đăng nhập tại 1 thời điểm)
+	globalTokenRevocationStore.SetActiveUserToken(user.Username, token, time.Now().Add(7*24*time.Hour))
+
 	// Ghi nhận lịch sử đăng nhập thành công
 	recordAccessLog(user.Username, user.Role, "login", r.RemoteAddr, fmt.Sprintf("Đăng nhập thành công với vai trò '%s'", user.Role))
 
