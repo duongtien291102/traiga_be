@@ -1,0 +1,6 @@
+*.exe
+*.log
+.env
+tmp/
+server.crt
+server.key
