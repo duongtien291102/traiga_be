@@ -1,4 +1,4 @@
-name: CI/CD Backend
+name: CI/CD Backend (Azure Container Apps)
 
 on:
   push:
@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ${{ secrets.DOCKER_HUB_USER }}/traiga-be:latest
+  IMAGE_REPO: docker.io/${{ secrets.DOCKER_HUB_USER }}/traiga-be
+  AZURE_APP: demo-webtraiga
+  AZURE_RG: jaika_group
 
 jobs:
   test:
@@ -36,24 +38,31 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}
+          # Tag theo commit SHA để Azure luôn tạo revision mới (tag :latest không trigger update)
+          tags: |
+            ${{ env.IMAGE_REPO }}:latest
+            ${{ env.IMAGE_REPO }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy backend to VPS
+    name: Deploy to Azure Container Apps
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - uses: appleboy/ssh-action@v1.0.3
+      - uses: azure/login@v2
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT || 22 }}
-          script: |
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update container app image
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
             set -e
-            cd /opt/traiga
-            docker compose pull backend
-            docker compose up -d backend
-            docker image prune -f
+            az extension add --name containerapp --upgrade --only-show-errors
+            # Backend lắng nghe cổng 8000; transport auto hỗ trợ cả HTTP & WebSocket
+            az containerapp ingress update -n "$AZURE_APP" -g "$AZURE_RG" \
+              --target-port 8000 --transport auto --only-show-errors -o none
+            az containerapp update -n "$AZURE_APP" -g "$AZURE_RG" \
+              --image "$IMAGE_REPO:${{ github.sha }}" --only-show-errors \
+              --query properties.configuration.ingress.fqdn -o tsv
