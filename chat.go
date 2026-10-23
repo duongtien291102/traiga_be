@@ -405,14 +405,21 @@ func (c *ChatClient) readPump() {
 				return
 			}
 
-			c.username = claims.Username
+			displayName := claims.Username
+			if claims.Role == "systemadmin" || claims.Username == "sysadmin" {
+				displayName = "Ban Quản Trị"
+			} else if claims.Role == "admin" || claims.Username == "admin01" {
+				displayName = "Chủ Trại"
+			}
+
+			c.username = displayName
 			c.role = claims.Role
 			c.authenticated = true
 
 			ack := WSOutboundMessage{
 				Type:    "auth_login_result",
 				Success: true,
-				User:    &User{Username: claims.Username, Role: claims.Role},
+				User:    &User{Username: displayName, Role: claims.Role},
 			}
 			if b, err := json.Marshal(ack); err == nil {
 				c.send <- b
@@ -589,9 +596,16 @@ func getRecentChatHistory(streamKey string) []ChatMessage {
 	msgs := make([]ChatMessage, 0)
 	_ = cursor.All(ctx, &msgs)
 
-	// Đảo ngược lại thứ tự để tin nhắn cũ ở trên, mới ở dưới
+	// Đảo ngược lại thứ tự để tin nhắn cũ ở trên, mới ở dưới và ẩn username nhạy cảm
 	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
 		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	for i := range msgs {
+		if msgs[i].Username == "sysadmin" || msgs[i].Role == "systemadmin" {
+			msgs[i].Username = "Ban Quản Trị"
+		} else if msgs[i].Username == "admin01" {
+			msgs[i].Username = "Chủ Trại"
+		}
 	}
 
 	return msgs
