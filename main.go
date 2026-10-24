@@ -369,6 +369,143 @@ func seedDefaultData() {
 			bson.M{"$set": bson.M{"user_id": adminID}},
 		)
 	}
+
+	// 4. Khởi tạo tài khoản admin02 (Chủ Trại Ba Bình Định) và dữ liệu thật
+	var admin02ID primitive.ObjectID
+	var admin02User User
+	errAdmin02 := usersColl.FindOne(ctx, bson.M{"username": "admin02"}).Decode(&admin02User)
+	if errAdmin02 != nil {
+		admin02Pass := strings.TrimSpace(os.Getenv("INITIAL_ADMIN02_PASSWORD"))
+		if admin02Pass == "" {
+			admin02Pass = "admin02@123"
+		}
+		hashed02, err := bcrypt.GenerateFromPassword([]byte(admin02Pass), bcrypt.DefaultCost)
+		if err == nil {
+			admin02 := User{
+				Username:  "admin02",
+				Password:  string(hashed02),
+				FullName:  "Chủ Trại Ba Bình Định",
+				Role:      "admin",
+				CreatedAt: time.Now(),
+			}
+			res02, errIns := usersColl.InsertOne(ctx, admin02)
+			if errIns == nil {
+				admin02ID = res02.InsertedID.(primitive.ObjectID)
+				log.Printf("👑 [ADMIN02 READY] Khởi tạo tài khoản 'admin02' thành công (ID: %s)", admin02ID.Hex())
+			}
+		}
+	} else {
+		admin02ID = admin02User.ID
+		log.Printf("👑 [ADMIN02 READY] Tài khoản 'admin02' đã sẵn sàng.")
+	}
+
+	// Tạo Stream Key thật cho admin02
+	if !admin02ID.IsZero() {
+		count02Key, _ := keysColl.CountDocuments(ctx, bson.M{"key": "babinhdinh"})
+		if count02Key == 0 {
+			_, _ = keysColl.InsertOne(ctx, StreamKey{
+				Key:       "babinhdinh",
+				Title:     "Trại Gà Đòn Ba Bình Định — Trực Tiếp Xổ Gà Thử Chân",
+				Streamer:  "Ba Bình Định",
+				UserID:    &admin02ID,
+				IsActive:  true,
+				MS:        "MS 201",
+				Chang:     "2.95 kg",
+				Loi:       "Lối ôm đấm kiềng hầu, đá mé xỏ ngang",
+				CanVay:    "Huyền trâm sát chậu, vuông sừng",
+				DatNuoc:   "Đạt 2 nước tơ",
+				CreatedAt: time.Now(),
+			})
+			log.Printf("📡 [STREAM KEY READY] Đã tạo Stream Key 'babinhdinh' cho tài khoản admin02")
+		}
+
+		// Tạo các chiến kê thật trong MongoDB cho admin02 (Chợ Gà Ba Miền)
+		if chickensColl != nil {
+			count02Chickens, _ := chickensColl.CountDocuments(ctx, bson.M{"created_by": "admin02"})
+			if count02Chickens == 0 {
+				now := time.Now()
+				sampleChickens := []interface{}{
+					Chicken{
+						ID:         primitive.NewObjectID(),
+						MS:         "MS 201",
+						Title:      "Ô Chân Trắng Điểm Mực 2.95kg Bo Đá Cực Chắc, Ôm Đấm Đòn Lưng",
+						Breed:      "don",
+						BreedName:  "Gà Đòn Bình Định",
+						Chang:      "2.95 kg",
+						Age:        "11 tháng tơ",
+						CanVay:     "Huyền trâm đóng đúng chậu, chân vuông sừng",
+						Loi:        "Lối ôm đấm kiềng hầu, đá mé giáp lưng",
+						DatNuoc:    "Đã dạt 2 nước chuẩn",
+						Price:      3500000,
+						PriceText:  "3.500.000 đ",
+						Farm:       "Trại Gà Ba Bình Định",
+						SellerName: "Ba Bình Định",
+						Phone:      "0988.888.201",
+						Zalo:       "0988.888.201",
+						Location:   "Quy Nhơn, Bình Định",
+						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
+						Status:     "available",
+						UserID:     &admin02ID,
+						CreatedBy:  "admin02",
+						CreatedAt:  now.Add(-2 * time.Hour),
+						UpdatedAt:  now,
+					},
+					Chicken{
+						ID:         primitive.NewObjectID(),
+						MS:         "MS 202",
+						Title:      "Tía Chân Xanh Án Thiên 1 Đòn Mé Xỏ Ngang Giáp Lưng Dạt Sườn",
+						Breed:      "don",
+						BreedName:  "Gà Đòn Tây Sơn",
+						Chang:      "3.10 kg",
+						Age:        "12 tháng",
+						CanVay:     "Án Thiên 1 sát gối, vảy khô ráo",
+						Loi:        "Mé xỏ ngang, đánh giáp lưng dạt sườn",
+						DatNuoc:    "Đã dạt 3 nước cứng",
+						Price:      4200000,
+						PriceText:  "4.200.000 đ",
+						Farm:       "Trại Gà Ba Bình Định",
+						SellerName: "Ba Bình Định",
+						Phone:      "0988.888.201",
+						Zalo:       "0988.888.201",
+						Location:   "Tây Sơn, Bình Định",
+						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
+						Status:     "available",
+						UserID:     &admin02ID,
+						CreatedBy:  "admin02",
+						CreatedAt:  now.Add(-1 * time.Hour),
+						UpdatedAt:  now,
+					},
+					Chicken{
+						ID:         primitive.NewObjectID(),
+						MS:         "MS 203",
+						Title:      "Xám Chuối 2.85kg Lối Đá Mé Nhanh Gọn Bo Lớn",
+						Breed:      "don",
+						BreedName:  "Gà Đòn Bình Định",
+						Chang:      "2.85 kg",
+						Age:        "10 tháng",
+						CanVay:     "Tam tài án thiên, chân khô đòn bén",
+						Loi:        "Đá mé kiềng đấm hầu",
+						DatNuoc:    "Đã dạt 2 nước tơ",
+						Price:      2900000,
+						PriceText:  "2.900.000 đ",
+						Farm:       "Trại Gà Ba Bình Định",
+						SellerName: "Ba Bình Định",
+						Phone:      "0988.888.201",
+						Zalo:       "0988.888.201",
+						Location:   "An Nhơn, Bình Định",
+						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
+						Status:     "available",
+						UserID:     &admin02ID,
+						CreatedBy:  "admin02",
+						CreatedAt:  now,
+						UpdatedAt:  now,
+					},
+				}
+				_, _ = chickensColl.InsertMany(ctx, sampleChickens)
+				log.Printf("🐔 [CHICKENS READY] Đã tạo 3 chiến kê thật trong MongoDB cho tài khoản admin02")
+			}
+		}
+	}
 }
 
 // createToken sinh chuỗi JWT token
