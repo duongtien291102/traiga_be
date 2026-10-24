@@ -183,115 +183,25 @@ func (m *BotRunnerManager) IsRunning(streamKey string) bool {
 	return exists
 }
 
-// seedDefaultBots tạo sẵn 5 Bot mẫu chất lượng nếu collection còn trống
-func seedDefaultBots() {
+// cleanMockBots xóa bỏ các Bot mẫu mock data để dữ liệu Bot trong DB chỉ bao gồm các Bot do Admin cấu hình thật
+func cleanMockBots() {
 	if botsColl == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	count, err := botsColl.CountDocuments(ctx, bson.M{})
-	if err == nil && count == 0 {
-		defaultBots := []interface{}{
-			ChatBot{
-				ID:        primitive.NewObjectID(),
-				Name:      "Minh Thư 🌸",
-				Avatar:    "🌸",
-				Role:      "user",
-				Interval:  12,
-				IsActive:  true,
-				CreatedBy: "sysadmin",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-				Messages: []string{
-					"Chào shop nhé! Chúc shop live đông khách ❤️",
-					"Sản phẩm này nhìn mê quá shop ơi!",
-					"Có size L hoặc XL không shop?",
-					"Shop tư vấn nhiệt tình ghê, lát em đặt liền",
-					"Đã follow kênh và bật chuông thông báo rồi nha!",
-					"Chốt 1 đơn nhé shop ơi!",
-				},
-			},
-			ChatBot{
-				ID:        primitive.NewObjectID(),
-				Name:      "Hoàng Long 🔥",
-				Avatar:    "🔥",
-				Role:      "vip",
-				Interval:  16,
-				IsActive:  true,
-				CreatedBy: "sysadmin",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-				Messages: []string{
-					"Hàng chuẩn chính hãng không anh ơi?",
-					"Hôm qua em mới nhận hàng xong, chất lượng siêu ưng luôn!",
-					"Chốt đơn uy tín luôn shop 👍",
-					"Hôm nay có mã giảm giá hay freeship không shop?",
-					"Mẫu này hot nhất đợt này rồi, mua nhanh kẻo hết ae ơi",
-					"Uy tín 100 điểm nha!",
-				},
-			},
-			ChatBot{
-				ID:        primitive.NewObjectID(),
-				Name:      "Lan Anh 9x 🛍️",
-				Avatar:    "🛍️",
-				Role:      "user",
-				Interval:  14,
-				IsActive:  true,
-				CreatedBy: "sysadmin",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-				Messages: []string{
-					"Đẹp xuất sắc luôn shop ơi!",
-					"Ship về Hà Nội mất mấy ngày ạ?",
-					"Có được kiểm tra hàng trước khi thanh toán không shop?",
-					"Đã thả tim cho idol nè ❤️",
-					"Mọi người tranh thủ mua nha, giá này hời lắm rồi",
-					"Shop live duyên dáng quá!",
-				},
-			},
-			ChatBot{
-				ID:        primitive.NewObjectID(),
-				Name:      "Quốc Bảo ⚡",
-				Avatar:    "⚡",
-				Role:      "user",
-				Interval:  18,
-				IsActive:  true,
-				CreatedBy: "sysadmin",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-				Messages: []string{
-					"Hàng đỉnh quá anh ơi, theo dõi live từ đầu tới giờ",
-					"Đang phân vân giữa mẫu 1 với mẫu 2, shop tư vấn giúp em",
-					"Ủng hộ shop 1 đơn mở bát 🎉",
-					"Chúc shop hôm nay nổ đơn liên tục nhé!",
-					"Âm thanh hình ảnh live nét căng luôn!",
-				},
-			},
-			ChatBot{
-				ID:        primitive.NewObjectID(),
-				Name:      "Phương Thảo 💖",
-				Avatar:    "💖",
-				Role:      "vip",
-				Interval:  15,
-				IsActive:  true,
-				CreatedBy: "sysadmin",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
-				Messages: []string{
-					"Thả tim liên tục nè shop ơi ❤️❤️❤️",
-					"Em vừa rủ bạn vào xem live cùng rồi nè",
-					"Chất vải với đường may nhìn sắc nét ghê",
-					"Đã chia sẻ live lên nhóm Facebook rồi nha!",
-					"Shop bán giá mềm mà chất lượng đỉnh thật sự!",
-				},
-			},
-		}
-
-		_, _ = botsColl.InsertMany(ctx, defaultBots)
-		log.Printf("🤖 [SEED] Đã khởi tạo thành công 5 Bot tương tác mẫu cho hệ thống!")
+	res, err := botsColl.DeleteMany(ctx, bson.M{
+		"name": bson.M{"$in": []string{"Minh Thư 🌸", "Hoàng Long 🔥", "Phương Thảo ✨", "Phương Thảo 💖", "Quốc Bảo ⚡", "Lan Anh 9x", "Lan Anh 9x 🛍️"}},
+	})
+	if err == nil && res.DeletedCount > 0 {
+		log.Printf("🧹 [CLEANUP] Đã xóa %d bot mẫu mock data khỏi MongoDB", res.DeletedCount)
 	}
+}
+
+// seedDefaultBots giữ lại tương thích, tự động dọn dẹp mock data
+func seedDefaultBots() {
+	cleanMockBots()
 }
 
 // ==================== SYSTEM ADMIN BOT HANDLERS ====================

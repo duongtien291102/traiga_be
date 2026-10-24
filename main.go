@@ -43,6 +43,12 @@ type StreamKey struct {
 	Streamer  string              `bson:"streamer" json:"streamer"`             // Tên hiển thị của streamer
 	UserID    *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"` // ID của user sở hữu
 	IsActive  bool                `bson:"is_active" json:"is_active"`           // Bật/tắt quyền phát
+	MS        string              `bson:"ms,omitempty" json:"ms,omitempty"`     // Mã số chiến kê
+	Chang     string              `bson:"chang,omitempty" json:"chang,omitempty"` // Chạng cân
+	Loi       string              `bson:"loi,omitempty" json:"loi,omitempty"`   // Lối đá
+	CanVay    string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"` // Cán vảy
+	DatNuoc   string              `bson:"dat_nuoc,omitempty" json:"dat_nuoc,omitempty"` // Đạt nước
+	Thumb     string              `bson:"thumb,omitempty" json:"thumb,omitempty"` // Ảnh đại diện
 	CreatedAt time.Time           `bson:"created_at" json:"created_at"`
 }
 
@@ -104,6 +110,7 @@ var (
 	keysColl       *mongo.Collection
 	sessionsColl   *mongo.Collection
 	chatColl       *mongo.Collection
+	chickensColl   *mongo.Collection
 	accessLogsColl *mongo.Collection
 	mongoMutex     sync.RWMutex
 	isMongoReady   bool
@@ -181,6 +188,7 @@ func initMongoDB() {
 	keysColl = db.Collection("stream_keys")
 	sessionsColl = db.Collection("live_sessions")
 	chatColl = db.Collection("chat_messages")
+	chickensColl = db.Collection("chickens")
 	accessLogsColl = db.Collection("access_logs")
 	botsColl = db.Collection("chat_bots")
 	roomBotsColl = db.Collection("room_bot_assignments")
@@ -189,8 +197,8 @@ func initMongoDB() {
 
 	log.Printf("✅ Đã kết nối thành công tới MongoDB Atlas (Database: %s)", dbName)
 
-	// Khởi tạo các bot mẫu nếu chưa có
-	go seedDefaultBots()
+	// Dọn dẹp bot mẫu mock data (nếu có)
+	go cleanMockBots()
 
 	// Tạo index unique cho username và key
 	_, _ = usersColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
@@ -200,6 +208,13 @@ func initMongoDB() {
 	_, _ = keysColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
 		Keys:    bson.M{"key": 1},
 		Options: options.Index().SetUnique(true),
+	})
+	// Index cho Chợ Gà (chickens)
+	_, _ = chickensColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+		Keys: bson.D{{Key: "created_at", Value: -1}},
+	})
+	_, _ = chickensColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+		Keys: bson.D{{Key: "status", Value: 1}},
 	})
 	// Index cho chat messages
 	_, _ = chatColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
@@ -1978,6 +1993,13 @@ func main() {
 	mux.HandleFunc("/api/replays", apiReplaysHandler)
 	mux.HandleFunc("/api/users", apiUsersHandler)
 	mux.HandleFunc("/health", healthHandler)
+
+	// APIs Chợ Gà Ba Miền (Lưu trữ MongoDB thật 100%)
+	mux.HandleFunc("/api/chickens", apiChickensHandler)
+
+	// APIs Danh sách phòng live công khai cho người xem (MongoDB stream_keys thật)
+	mux.HandleFunc("/api/rooms", apiPublicRoomsHandler)
+	mux.HandleFunc("/api/public/rooms", apiPublicRoomsHandler)
 
 	// APIs Quản trị cấp cao System Admin
 	mux.HandleFunc("/api/sysadmin/users", sysadminUsersHandler)
