@@ -89,3 +89,55 @@ func TestRoomIsolation(t *testing.T) {
 	t.Log("✅ Kênh chat của các phòng hoạt động hoàn toàn độc lập, không bị lẫn lộn!")
 }
 
+// TestChatResetBroadcastAndOfflineHistory kiểm tra cơ chế reset chat và ẩn tin nhắn khi luồng offline
+func TestChatResetBroadcastAndOfflineHistory(t *testing.T) {
+	// 1. Kiểm tra getRecentChatHistory trên phòng offline hoặc chưa live -> phải trả về rỗng []
+	historyOffline := getRecentChatHistory("offline_room_test")
+	if len(historyOffline) != 0 {
+		t.Errorf("Phòng offline không được trả về lịch sử chat cũ, mong muốn 0 tin nhắn nhưng nhận %d", len(historyOffline))
+	}
+
+	// 2. Kiểm tra broadcastResetChat phát sự kiện reset_chat tới đúng client trong phòng
+	server := httptest.NewServer(http.HandlerFunc(wsChatHandler))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	originHeader := http.Header{"Origin": []string{"http://localhost:3000"}}
+
+	urlA := wsURL + "/ws/chat?streamKey=reset_room"
+	connA, _, err := websocket.DefaultDialer.Dial(urlA, originHeader)
+	if err != nil {
+		t.Fatalf("Client A kết nối thất bại: %v", err)
+	}
+	defer connA.Close()
+
+	authA, _ := json.Marshal(WSInboundMessage{Type: "auth_guest", GuestName: "Viewer_1"})
+	_ = connA.WriteMessage(websocket.TextMessage, authA)
+
+	// Đọc các message khởi tạo
+	for i := 0; i < 3; i++ {
+		connA.SetReadDeadline(time.Now().Add(1 * time.Second))
+		_, _, _ = connA.ReadMessage()
+	}
+
+	// Phát lệnh reset kênh chat
+	broadcastResetChat("reset_room")
+
+	// Client A phải nhận được sự kiện type "reset_chat"
+	connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, pReset, err := connA.ReadMessage()
+	if err != nil {
+		t.Fatalf("Client không nhận được thông báo reset_chat: %v", err)
+	}
+
+	var resetMsg WSOutboundMessage
+	if err := json.Unmarshal(pReset, &resetMsg); err != nil {
+		t.Fatalf("Lỗi parse reset_chat: %v", err)
+	}
+	if resetMsg.Type != "reset_chat" {
+		t.Fatalf("Loại tin nhắn mong muốn là 'reset_chat', nhận được: %s", resetMsg.Type)
+	}
+
+	t.Log("✅ Sự kiện reset_chat được phát thành công và lịch sử offline bị ẩn hoàn toàn!")
+}
+

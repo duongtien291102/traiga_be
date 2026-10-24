@@ -619,7 +619,30 @@ func saveChatMessage(msg ChatMessage) {
 	}
 }
 
-// getRecentChatHistory lấy 50 tin nhắn mới nhất của phòng
+// broadcastResetChat gửi sự kiện reset/xóa trắng khung chat tới tất cả người xem trong phòng
+func broadcastResetChat(streamKey string) {
+	out := WSOutboundMessage{
+		Type: "reset_chat",
+	}
+	if b, err := json.Marshal(out); err == nil {
+		globalChatHub.broadcast <- broadcastEvent{streamKey: streamKey, message: b}
+	}
+}
+
+// clearRoomChatHistory xóa toàn bộ tin nhắn chat trong DB và phát lệnh reset cho client
+func clearRoomChatHistory(streamKey string) {
+	if streamKey == "" {
+		return
+	}
+	if chatColl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = chatColl.DeleteMany(ctx, bson.M{"stream_key": streamKey})
+	}
+	broadcastResetChat(streamKey)
+}
+
+// getRecentChatHistory lấy các tin nhắn của phiên live hiện tại (nếu offline thì không hiển thị lịch sử cũ)
 func getRecentChatHistory(streamKey string) []ChatMessage {
 	if chatColl == nil {
 		return []ChatMessage{}
@@ -627,29 +650,47 @@ func getRecentChatHistory(streamKey string) []ChatMessage {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(50)
-	cursor, err := chatColl.Find(ctx, bson.M{"stream_key": streamKey}, opts)
-	if err != nil {
-		return []ChatMessage{}
-	}
-	defer cursor.Close(ctx)
-
-	msgs := make([]ChatMessage, 0)
-	_ = cursor.All(ctx, &msgs)
-
-	// Đảo ngược lại thứ tự để tin nhắn cũ ở trên, mới ở dưới và ẩn username nhạy cảm
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
-	for i := range msgs {
-		if msgs[i].Username == "sysadmin" || msgs[i].Role == "systemadmin" {
-			msgs[i].Username = "Ban Quản Trị"
-		} else if msgs[i].Username == "admin01" {
-			msgs[i].Username = "Chủ Trại"
+	// Nếu có sessionsColl, kiểm tra xem phòng có phiên live đang hoạt động hay không
+	if sessionsColl != nil {
+		var activeSession LiveSession
+		optsSess := options.FindOne().SetSort(bson.M{"started_at": -1})
+		err := sessionsColl.FindOne(ctx, bson.M{"stream_key": streamKey, "status": "live"}, optsSess).Decode(&activeSession)
+		if err != nil {
+			// Luồng không live (offline) -> Trả về mảng rỗng, không hiện lịch sử quá khứ
+			return []ChatMessage{}
 		}
+
+		// Chỉ lấy các tin nhắn phát sinh trong phiên live hiện tại (từ started_at trở đi)
+		opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(50)
+		filter := bson.M{
+			"stream_key": streamKey,
+			"created_at": bson.M{"$gte": activeSession.StartedAt},
+		}
+		cursor, err := chatColl.Find(ctx, filter, opts)
+		if err != nil {
+			return []ChatMessage{}
+		}
+		defer cursor.Close(ctx)
+
+		msgs := make([]ChatMessage, 0)
+		_ = cursor.All(ctx, &msgs)
+
+		// Đảo ngược lại thứ tự để tin nhắn cũ ở trên, mới ở dưới và ẩn username nhạy cảm
+		for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+			msgs[i], msgs[j] = msgs[j], msgs[i]
+		}
+		for i := range msgs {
+			if msgs[i].Username == "sysadmin" || msgs[i].Role == "systemadmin" {
+				msgs[i].Username = "Ban Quản Trị"
+			} else if msgs[i].Username == "admin01" {
+				msgs[i].Username = "Chủ Trại"
+			}
+		}
+
+		return msgs
 	}
 
-	return msgs
+	return []ChatMessage{}
 }
 
 // wsChatHandler xử lý nâng cấp WebSocket cho phòng chat
