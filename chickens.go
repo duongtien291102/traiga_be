@@ -367,6 +367,9 @@ func apiPublicRoomsHandler(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(farmName, "Trại") {
 			farmName = "Trại Gà " + farmName
 		}
+		if !strings.Contains(farmName, "Thành Trung") {
+			farmName = "Trại Gà Thành Trung 01"
+		}
 
 		result = append(result, PublicRoomInfo{
 			ID:       k.Key,

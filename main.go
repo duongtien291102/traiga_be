@@ -31,7 +31,9 @@ type User struct {
 	Username  string             `bson:"username" json:"username"`
 	Password  string             `bson:"password" json:"-"`
 	FullName  string             `bson:"full_name" json:"full_name"`
-	Role      string             `bson:"role" json:"role"` // "admin" hoặc "user"
+	Avatar    string             `bson:"avatar,omitempty" json:"avatar,omitempty"`
+	Phone     string             `bson:"phone,omitempty" json:"phone,omitempty"`
+	Role      string             `bson:"role" json:"role"` // "systemadmin", "admin" hoặc "user"
 	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
 }
 
@@ -345,19 +347,29 @@ func seedDefaultData() {
 	if count == 0 {
 		defaultKeys := []interface{}{
 			StreamKey{
-				Key:       "tiendev",
-				Title:     "Kênh Livestream Tiên Dev",
-				Streamer:  "Admin Tiên Dev",
+				Key:       "thanhtrung01",
+				Title:     "Trại Gà Thành Trung 01 — Trực Tiếp Giao Lưu Chiến Kê",
+				Streamer:  "Thành Trung 01",
 				UserID:    &adminID,
 				IsActive:  true,
+				MS:        "MS 101",
+				Chang:     "2.95 kg",
+				Loi:       "Lối ôm đấm kiềng hầu, đá mé giáp lưng",
+				CanVay:    "Huyền trâm đóng đúng chậu, chân vuông sừng",
+				DatNuoc:   "Đã dạt 2 nước chuẩn",
 				CreatedAt: time.Now(),
 			},
 			StreamKey{
-				Key:       "supersecret",
-				Title:     "Kênh VIP Đặc Biệt",
-				Streamer:  "Admin",
+				Key:       "thanhtrung02",
+				Title:     "Trại Gà Thành Trung 02 — Trực Tiếp Giao Lưu Chiến Kê",
+				Streamer:  "Thành Trung 02",
 				UserID:    &adminID,
 				IsActive:  true,
+				MS:        "MS 201",
+				Chang:     "3.10 kg",
+				Loi:       "Mé xỏ ngang, đánh giáp lưng dạt sườn",
+				CanVay:    "Án Thiên 1 sát gối, vảy khô ráo",
+				DatNuoc:   "Đã dạt 3 nước cứng",
 				CreatedAt: time.Now(),
 			},
 		}
@@ -365,12 +377,12 @@ func seedDefaultData() {
 	} else if !adminID.IsZero() {
 		// Đảm bảo các key hệ thống thuộc về adminID
 		_, _ = keysColl.UpdateMany(ctx,
-			bson.M{"key": bson.M{"$in": []string{"tiendev", "supersecret"}}},
+			bson.M{"key": bson.M{"$in": []string{"thanhtrung01", "thanhtrung02", "tiendev", "supersecret"}}},
 			bson.M{"$set": bson.M{"user_id": adminID}},
 		)
 	}
 
-	// 4. Khởi tạo tài khoản admin02 (Chủ Trại Ba Bình Định) và dữ liệu thật
+	// 4. Khởi tạo tài khoản admin02 (Chủ Trại Thành Trung 02) và dữ liệu thật
 	var admin02ID primitive.ObjectID
 	var admin02User User
 	errAdmin02 := usersColl.FindOne(ctx, bson.M{"username": "admin02"}).Decode(&admin02User)
@@ -384,7 +396,7 @@ func seedDefaultData() {
 			admin02 := User{
 				Username:  "admin02",
 				Password:  string(hashed02),
-				FullName:  "Chủ Trại Ba Bình Định",
+				FullName:  "Chủ Trại Thành Trung 02",
 				Role:      "admin",
 				CreatedAt: time.Now(),
 			}
@@ -401,25 +413,25 @@ func seedDefaultData() {
 
 	// Tạo Stream Key thật cho admin02
 	if !admin02ID.IsZero() {
-		count02Key, _ := keysColl.CountDocuments(ctx, bson.M{"key": "babinhdinh"})
+		count02Key, _ := keysColl.CountDocuments(ctx, bson.M{"key": "thanhtrung02"})
 		if count02Key == 0 {
 			_, _ = keysColl.InsertOne(ctx, StreamKey{
-				Key:       "babinhdinh",
-				Title:     "Trại Gà Đòn Ba Bình Định — Trực Tiếp Xổ Gà Thử Chân",
-				Streamer:  "Ba Bình Định",
+				Key:       "thanhtrung02",
+				Title:     "Trại Gà Thành Trung 02 — Trực Tiếp Giao Lưu Chiến Kê",
+				Streamer:  "Thành Trung 02",
 				UserID:    &admin02ID,
 				IsActive:  true,
 				MS:        "MS 201",
-				Chang:     "2.95 kg",
-				Loi:       "Lối ôm đấm kiềng hầu, đá mé xỏ ngang",
-				CanVay:    "Huyền trâm sát chậu, vuông sừng",
-				DatNuoc:   "Đạt 2 nước tơ",
+				Chang:     "3.10 kg",
+				Loi:       "Mé xỏ ngang, đánh giáp lưng dạt sườn",
+				CanVay:    "Án Thiên 1 sát gối, vảy khô ráo",
+				DatNuoc:   "Đã dạt 3 nước cứng",
 				CreatedAt: time.Now(),
 			})
-			log.Printf("📡 [STREAM KEY READY] Đã tạo Stream Key 'babinhdinh' cho tài khoản admin02")
+			log.Printf("📡 [STREAM KEY READY] Đã tạo Stream Key 'thanhtrung02' cho tài khoản admin02")
 		}
 
-		// Tạo các chiến kê thật trong MongoDB cho admin02 (Chợ Gà Ba Miền)
+		// Tạo các chiến kê thật trong MongoDB cho admin02
 		if chickensColl != nil {
 			count02Chickens, _ := chickensColl.CountDocuments(ctx, bson.M{"created_by": "admin02"})
 			if count02Chickens == 0 {
@@ -430,7 +442,7 @@ func seedDefaultData() {
 						MS:         "MS 201",
 						Title:      "Ô Chân Trắng Điểm Mực 2.95kg Bo Đá Cực Chắc, Ôm Đấm Đòn Lưng",
 						Breed:      "don",
-						BreedName:  "Gà Đòn Bình Định",
+						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
 						Chang:      "2.95 kg",
 						Age:        "11 tháng tơ",
 						CanVay:     "Huyền trâm đóng đúng chậu, chân vuông sừng",
@@ -438,11 +450,11 @@ func seedDefaultData() {
 						DatNuoc:    "Đã dạt 2 nước chuẩn",
 						Price:      3500000,
 						PriceText:  "3.500.000 đ",
-						Farm:       "Trại Gà Ba Bình Định",
-						SellerName: "Ba Bình Định",
+						Farm:       "Trại Gà Thành Trung 01",
+						SellerName: "Thành Trung 01",
 						Phone:      "0988.888.201",
 						Zalo:       "0988.888.201",
-						Location:   "Quy Nhơn, Bình Định",
+						Location:   "Long Biên, Hà Nội",
 						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
 						Status:     "available",
 						UserID:     &admin02ID,
@@ -455,7 +467,7 @@ func seedDefaultData() {
 						MS:         "MS 202",
 						Title:      "Tía Chân Xanh Án Thiên 1 Đòn Mé Xỏ Ngang Giáp Lưng Dạt Sườn",
 						Breed:      "don",
-						BreedName:  "Gà Đòn Tây Sơn",
+						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
 						Chang:      "3.10 kg",
 						Age:        "12 tháng",
 						CanVay:     "Án Thiên 1 sát gối, vảy khô ráo",
@@ -463,11 +475,11 @@ func seedDefaultData() {
 						DatNuoc:    "Đã dạt 3 nước cứng",
 						Price:      4200000,
 						PriceText:  "4.200.000 đ",
-						Farm:       "Trại Gà Ba Bình Định",
-						SellerName: "Ba Bình Định",
+						Farm:       "Trại Gà Thành Trung 02",
+						SellerName: "Thành Trung 02",
 						Phone:      "0988.888.201",
 						Zalo:       "0988.888.201",
-						Location:   "Tây Sơn, Bình Định",
+						Location:   "Long Biên, Hà Nội",
 						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
 						Status:     "available",
 						UserID:     &admin02ID,
@@ -480,7 +492,7 @@ func seedDefaultData() {
 						MS:         "MS 203",
 						Title:      "Xám Chuối 2.85kg Lối Đá Mé Nhanh Gọn Bo Lớn",
 						Breed:      "don",
-						BreedName:  "Gà Đòn Bình Định",
+						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
 						Chang:      "2.85 kg",
 						Age:        "10 tháng",
 						CanVay:     "Tam tài án thiên, chân khô đòn bén",
@@ -488,11 +500,11 @@ func seedDefaultData() {
 						DatNuoc:    "Đã dạt 2 nước tơ",
 						Price:      2900000,
 						PriceText:  "2.900.000 đ",
-						Farm:       "Trại Gà Ba Bình Định",
-						SellerName: "Ba Bình Định",
+						Farm:       "Trại Gà Thành Trung 03",
+						SellerName: "Thành Trung 03",
 						Phone:      "0988.888.201",
 						Zalo:       "0988.888.201",
-						Location:   "An Nhơn, Bình Định",
+						Location:   "Long Biên, Hà Nội",
 						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
 						Status:     "available",
 						UserID:     &admin02ID,
@@ -618,7 +630,7 @@ func verifyStreamKey(streamKey string) bool {
 		}
 
 		// Cho phép các key quản trị viên mặc định
-		if streamKey == "tiendev" || streamKey == "supersecret" || streamKey == "test" {
+		if strings.HasPrefix(streamKey, "thanhtrung") || streamKey == "tiendev" || streamKey == "supersecret" || streamKey == "test" {
 			log.Printf("👑 [AUTH APPROVED] Chấp nhận key quản trị mặc định: '%s'", streamKey)
 			return true
 		}
@@ -628,7 +640,11 @@ func verifyStreamKey(streamKey string) bool {
 	}
 
 	// Fallback nếu DB offline
-	fallback := map[string]bool{"tiendev": true, "supersecret": true, "test": true}
+	fallback := map[string]bool{
+		"thanhtrung01": true, "thanhtrung02": true, "thanhtrung03": true, "thanhtrung04": true,
+		"thanhtrung05": true, "thanhtrung06": true, "thanhtrung07": true, "thanhtrung08": true,
+		"tiendev": true, "supersecret": true, "test": true,
+	}
 	return fallback[streamKey]
 }
 
@@ -1131,6 +1147,159 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 		"stream_key":  streamKeyStr,
 		"stream_keys": userKeys,
 	})
+}
+
+// profileHandler xử lý xem và cập nhật thông tin hồ sơ cá nhân và avatar lưu trữ trong cơ sở dữ liệu MongoDB
+func profileHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	claims, err := getUserFromAuthHeader(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Chưa đăng nhập hoặc phiên làm việc đã hết hạn"})
+		return
+	}
+
+	objID, err := primitive.ObjectIDFromHex(claims.UserID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Mã người dùng không hợp lệ"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	switch r.Method {
+	case http.MethodGet:
+		var user User
+		if err := usersColl.FindOne(ctx, bson.M{"_id": objID}).Decode(&user); err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy thông tin tài khoản"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"user": user,
+		})
+
+	case http.MethodPut, http.MethodPost:
+		// Cho phép tối đa 2MB để upload avatar dạng Base64 Data URL hoặc link ảnh
+		limitRequestBody(w, r, 2*1024*1024)
+
+		var req struct {
+			FullName        *string `json:"full_name"`
+			Avatar          *string `json:"avatar"`
+			Phone           *string `json:"phone"`
+			CurrentPassword string  `json:"current_password"`
+			NewPassword     string  `json:"new_password"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Dữ liệu gửi lên không đúng định dạng JSON"})
+			return
+		}
+
+		var currentUser User
+		if err := usersColl.FindOne(ctx, bson.M{"_id": objID}).Decode(&currentUser); err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy tài khoản người dùng"})
+			return
+		}
+
+		updateFields := bson.M{}
+
+		if req.FullName != nil {
+			trimmedName := strings.TrimSpace(*req.FullName)
+			if len(trimmedName) > 100 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Họ và tên không được vượt quá 100 ký tự"})
+				return
+			}
+			if trimmedName != "" {
+				updateFields["full_name"] = trimmedName
+			}
+		}
+
+		if req.Phone != nil {
+			trimmedPhone := strings.TrimSpace(*req.Phone)
+			if len(trimmedPhone) > 20 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Số điện thoại không hợp lệ (tối đa 20 ký tự)"})
+				return
+			}
+			updateFields["phone"] = trimmedPhone
+		}
+
+		if req.Avatar != nil {
+			ava := strings.TrimSpace(*req.Avatar)
+			// Giới hạn độ dài avatar base64/url <= 1.5MB
+			if len(ava) > 1500000 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Dung lượng ảnh đại diện quá lớn (tối đa ~1MB). Vui lòng chọn ảnh nhỏ hơn."})
+				return
+			}
+			updateFields["avatar"] = ava
+		}
+
+		if req.NewPassword != "" {
+			if req.CurrentPassword == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Vui lòng nhập mật khẩu hiện tại để xác nhận đổi mật khẩu"})
+				return
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(currentUser.Password), []byte(req.CurrentPassword)); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Mật khẩu hiện tại không chính xác"})
+				return
+			}
+			if len(req.NewPassword) < 6 || len(req.NewPassword) > 72 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Mật khẩu mới phải có độ dài từ 6 đến 72 ký tự"})
+				return
+			}
+			hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi mã hóa mật khẩu"})
+				return
+			}
+			updateFields["password"] = string(hashedPassword)
+		}
+
+		if len(updateFields) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Không có thông tin nào được cập nhật"})
+			return
+		}
+
+		_, errUpdate := usersColl.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{"$set": updateFields})
+		if errUpdate != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi lưu dữ liệu người dùng vào cơ sở dữ liệu"})
+			return
+		}
+
+		// Nếu đổi FullName và người dùng là Admin streamer, đồng bộ luôn tên hiển thị ở StreamKey
+		if req.FullName != nil && strings.TrimSpace(*req.FullName) != "" && currentUser.Role == "admin" {
+			_, _ = keysColl.UpdateMany(ctx, bson.M{"user_id": objID}, bson.M{"$set": bson.M{"streamer": strings.TrimSpace(*req.FullName)}})
+		}
+
+		// Lấy lại user sau khi cập nhật thành công từ database
+		var updatedUser User
+		_ = usersColl.FindOne(ctx, bson.M{"_id": objID}).Decode(&updatedUser)
+
+		recordAccessLog(currentUser.Username, currentUser.Role, "update_profile", getClientIP(r), "Cập nhật hồ sơ cá nhân và ảnh đại diện vào cơ sở dữ liệu")
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "Cập nhật thông tin và ảnh đại diện thành công!",
+			"user":    updatedUser,
+		})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method Not Allowed"})
+	}
 }
 
 // ==================== STREAM KEY & SESSION CONTROLLERS ====================
@@ -2121,6 +2290,8 @@ func main() {
 	mux.HandleFunc("/api/auth/login", loginHandler)
 	mux.HandleFunc("/api/auth/logout", logoutHandler)
 	mux.HandleFunc("/api/auth/me", meHandler)
+	mux.HandleFunc("/api/auth/profile", profileHandler)
+	mux.HandleFunc("/api/user/profile", profileHandler)
 
 	// APIs Quản lý Stream Keys, Sessions & Video Xem Lại (Replays)
 	mux.HandleFunc("/api/keys", apiKeysHandler)

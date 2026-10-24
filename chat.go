@@ -26,6 +26,7 @@ type ChatMessage struct {
 	SessionID string             `bson:"session_id,omitempty" json:"session_id,omitempty"` // ID phiên live (để lưu trữ và xem lại)
 	StreamKey string             `bson:"stream_key" json:"stream_key"`
 	Username  string             `bson:"username" json:"username"`
+	Avatar    string             `bson:"avatar,omitempty" json:"avatar,omitempty"`
 	Role      string             `bson:"role" json:"role"` // "admin" | "streamer" | "user" | "guest"
 	Message   string             `bson:"message" json:"message"`
 	Type      string             `bson:"type" json:"type"` // "chat" | "system" | "reaction"
@@ -148,6 +149,7 @@ type ChatClient struct {
 	send          chan []byte
 	streamKey     string
 	username      string
+	avatar        string
 	role          string
 	clientIP      string
 	authenticated bool
@@ -403,6 +405,7 @@ func (c *ChatClient) readPump() {
 			if c.username == "" {
 				c.username = user.Username
 			}
+			c.avatar = user.Avatar
 			c.role = user.Role
 			c.authenticated = true
 
@@ -454,14 +457,30 @@ func (c *ChatClient) readPump() {
 				displayName = "Chủ Trại"
 			}
 
+			userAvatar := ""
+			if usersColl != nil {
+				if objID, errID := primitive.ObjectIDFromHex(claims.UserID); errID == nil {
+					ctxU, cancelU := context.WithTimeout(context.Background(), 2*time.Second)
+					var u User
+					if errU := usersColl.FindOne(ctxU, bson.M{"_id": objID}).Decode(&u); errU == nil {
+						userAvatar = u.Avatar
+						if u.FullName != "" && claims.Role != "systemadmin" {
+							displayName = u.FullName
+						}
+					}
+					cancelU()
+				}
+			}
+
 			c.username = displayName
+			c.avatar = userAvatar
 			c.role = claims.Role
 			c.authenticated = true
 
 			ack := WSOutboundMessage{
 				Type:    "auth_login_result",
 				Success: true,
-				User:    &User{Username: displayName, Role: claims.Role},
+				User:    &User{Username: displayName, Role: claims.Role, Avatar: userAvatar},
 			}
 			if b, err := json.Marshal(ack); err == nil {
 				c.send <- b
@@ -526,6 +545,7 @@ func (c *ChatClient) readPump() {
 				ID:        primitive.NewObjectID(),
 				StreamKey: c.streamKey,
 				Username:  c.username,
+				Avatar:    c.avatar,
 				Role:      c.role,
 				Message:   msgText,
 				Type:      "chat",
