@@ -110,6 +110,12 @@ func isOriginAllowed(origin string, requestHost string) bool {
 		}
 	}
 
+	// Cho phép tất cả các preview domain của vercel.app (ví dụ traiga-fe-*.vercel.app)
+	hostLower := strings.ToLower(parsedOrigin.Host)
+	if strings.HasSuffix(hostLower, ".vercel.app") || hostLower == "vercel.app" {
+		return true
+	}
+
 	// Cho phép kết nối nếu cùng Host với backend hoặc reverse proxy
 	if requestHost != "" && strings.EqualFold(parsedOrigin.Host, requestHost) {
 		return true
@@ -423,14 +429,14 @@ func (c *ChatClient) readPump() {
 			tStr = strings.TrimPrefix(tStr, "bearer ")
 
 			if tStr == "" || len(tStr) > 4096 {
-				c.sendAuthErrorAndClose("Token xác thực rỗng hoặc kích thước vượt giới hạn")
-				return
+				c.fallbackToGuest(in.Sender, "Token xác thực rỗng")
+				continue
 			}
 
 			// Kiểm tra thu hồi token (P1-5)
 			if globalTokenRevocationStore.IsTokenRevoked(tStr) {
-				c.sendAuthErrorAndClose("Token đã bị thu hồi do đăng xuất")
-				return
+				c.fallbackToGuest(in.Sender, "Token đã bị thu hồi do đăng xuất")
+				continue
 			}
 
 			token, err := jwt.ParseWithClaims(tStr, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
@@ -440,14 +446,14 @@ func (c *ChatClient) readPump() {
 				return jwtSecret, nil
 			})
 			if err != nil || !token.Valid {
-				c.sendAuthErrorAndClose("Token không hợp lệ hoặc đã hết hạn")
-				return
+				c.fallbackToGuest(in.Sender, "Token không hợp lệ hoặc đã hết hạn")
+				continue
 			}
 
 			claims, ok := token.Claims.(*JWTClaims)
 			if !ok {
-				c.sendAuthErrorAndClose("Claims token không hợp lệ")
-				return
+				c.fallbackToGuest(in.Sender, "Claims token không hợp lệ")
+				continue
 			}
 
 			displayName := claims.Username
@@ -576,6 +582,39 @@ func (c *ChatClient) sendChatHistory() {
 	if hBytes, err := json.Marshal(historyMsg); err == nil {
 		c.send <- hBytes
 	}
+}
+
+// fallbackToGuest tự động chuyển sang chế độ Khách thay vì đóng socket khi token gặp sự cố
+func (c *ChatClient) fallbackToGuest(sender string, reason string) {
+	gName := strings.TrimSpace(sender)
+	if gName == "" {
+		gName = fmt.Sprintf("Khách_%d", time.Now().Unix()%10000)
+	}
+	if len(gName) > 30 {
+		gName = gName[:30]
+	}
+	c.username = gName
+	c.role = "guest"
+	c.authenticated = true
+
+	warn := WSOutboundMessage{
+		Type:  "error",
+		Error: reason + ", đã chuyển sang chế độ Khách",
+	}
+	if b, err := json.Marshal(warn); err == nil {
+		c.send <- b
+	}
+
+	ack := WSOutboundMessage{
+		Type:    "auth_login_result",
+		Success: true,
+		User:    &User{Username: gName, Role: "guest"},
+	}
+	if b, err := json.Marshal(ack); err == nil {
+		c.send <- b
+	}
+
+	c.sendChatHistory()
 }
 
 // sendAuthErrorAndClose gửi thông báo lỗi xác thực và đóng socket an toàn
@@ -755,11 +794,11 @@ func wsChatHandler(w http.ResponseWriter, r *http.Request) {
 
 	client.hub.register <- client
 
-	// Timeout xác thực: đóng kết nối an toàn nếu sau 10 giây client chưa gửi message xác thực
+	// Timeout xác thực: tự động gán vai trò Khách nếu sau 10 giây client chưa gửi message xác thực (không đóng socket)
 	go func() {
 		time.Sleep(10 * time.Second)
 		if !client.authenticated {
-			client.sendAuthErrorAndClose("Quá thời gian xác thực WebSocket")
+			client.fallbackToGuest("", "Tự động kích hoạt chế độ Khách")
 		}
 	}()
 
