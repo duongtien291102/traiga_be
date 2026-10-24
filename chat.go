@@ -23,6 +23,7 @@ import (
 // ChatMessage đại diện cho 1 tin nhắn trong phòng live
 type ChatMessage struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	SessionID string             `bson:"session_id,omitempty" json:"session_id,omitempty"` // ID phiên live (để lưu trữ và xem lại)
 	StreamKey string             `bson:"stream_key" json:"stream_key"`
 	Username  string             `bson:"username" json:"username"`
 	Role      string             `bson:"role" json:"role"` // "admin" | "streamer" | "user" | "guest"
@@ -605,13 +606,22 @@ func (c *ChatClient) writePump() {
 	}
 }
 
-// saveChatMessage lưu tin nhắn vào MongoDB collection chat_messages
+// saveChatMessage lưu tin nhắn vào MongoDB collection chat_messages (luôn lưu trữ vĩnh viễn trong DB)
 func saveChatMessage(msg ChatMessage) {
 	if chatColl == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Tự động gắn SessionID nếu đang trong phiên live để tiện tra cứu / xem lại theo từng phiên
+	if msg.SessionID == "" && sessionsColl != nil && msg.StreamKey != "" {
+		var activeSess LiveSession
+		optsSess := options.FindOne().SetSort(bson.M{"started_at": -1})
+		if err := sessionsColl.FindOne(ctx, bson.M{"stream_key": msg.StreamKey, "status": "live"}, optsSess).Decode(&activeSess); err == nil {
+			msg.SessionID = activeSess.ID.Hex()
+		}
+	}
 
 	_, err := chatColl.InsertOne(ctx, msg)
 	if err != nil {
@@ -629,17 +639,19 @@ func broadcastResetChat(streamKey string) {
 	}
 }
 
-// clearRoomChatHistory xóa toàn bộ tin nhắn chat trong DB và phát lệnh reset cho client
-func clearRoomChatHistory(streamKey string) {
+// resetRoomChat phát lệnh reset khung chat trên giao diện người xem, giữ nguyên 100% dữ liệu tin nhắn lưu trong DB
+func resetRoomChat(streamKey string) {
 	if streamKey == "" {
 		return
 	}
-	if chatColl != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = chatColl.DeleteMany(ctx, bson.M{"stream_key": streamKey})
-	}
+	// Tuyệt đối không xóa tin nhắn trong MongoDB (chat_messages) để phục vụ lưu trữ vĩnh viễn và xem lại.
+	// Chỉ phát tín hiệu reset cho client đang kết nối bắt đầu phiên trò chuyện mới.
 	broadcastResetChat(streamKey)
+}
+
+// clearRoomChatHistory giữ tên hàm tương thích với các điểm gọi cũ, chỉ reset giao diện chứ không xóa DB
+func clearRoomChatHistory(streamKey string) {
+	resetRoomChat(streamKey)
 }
 
 // getRecentChatHistory lấy các tin nhắn của phiên live hiện tại (nếu offline thì không hiển thị lịch sử cũ)
@@ -738,12 +750,37 @@ func wsChatHandler(w http.ResponseWriter, r *http.Request) {
 
 // apiChatHistoryHandler REST API lấy lịch sử chat
 // GET /api/chat/history?streamKey=tiendev
+// GET /api/chat/history?streamKey=tiendev&sessionId=... (hỗ trợ xem lại tin nhắn của các phiên live cũ trong DB)
 func apiChatHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	streamKey := strings.TrimSpace(r.URL.Query().Get("streamKey"))
 	if streamKey == "" {
 		http.Error(w, `{"error":"streamKey is required"}`, http.StatusBadRequest)
 		return
+	}
+
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	if sessionID != "" && chatColl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		opts := options.Find().SetSort(bson.M{"created_at": 1}).SetLimit(500)
+		filter := bson.M{"stream_key": streamKey, "session_id": sessionID}
+		cursor, err := chatColl.Find(ctx, filter, opts)
+		if err == nil {
+			defer cursor.Close(ctx)
+			msgs := make([]ChatMessage, 0)
+			_ = cursor.All(ctx, &msgs)
+			for i := range msgs {
+				if msgs[i].Username == "sysadmin" || msgs[i].Role == "systemadmin" {
+					msgs[i].Username = "Ban Quản Trị"
+				} else if msgs[i].Username == "admin01" {
+					msgs[i].Username = "Chủ Trại"
+				}
+			}
+			json.NewEncoder(w).Encode(msgs)
+			return
+		}
 	}
 
 	history := getRecentChatHistory(streamKey)

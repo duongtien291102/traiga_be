@@ -522,8 +522,8 @@ func recordLiveSession(streamKey, app, clientIP string) {
 		_, _ = coll.InsertOne(ctx, session)
 		recordAccessLog(streamerName, "admin", "start_stream", clientIP, fmt.Sprintf("Bắt đầu phát sóng luồng '%s' (App: %s)", streamKey, app))
 
-		// Mỗi lần live mới bắt đầu: Reset sạch kênh chat và thông báo WebSocket client
-		clearRoomChatHistory(streamKey)
+		// Mỗi lần live mới bắt đầu: Phát lệnh reset kênh chat cho client (toàn bộ tin nhắn vẫn được lưu trữ vĩnh viễn trong DB)
+		resetRoomChat(streamKey)
 	}()
 }
 
@@ -616,8 +616,8 @@ func unpublishHandler(w http.ResponseWriter, r *http.Request) {
 			// Dừng bot tương tác trong phòng live khi streamer kết thúc live
 			globalBotManager.StopBots(streamKey)
 
-			// Luồng kết thúc: Reset sạch kênh chat để không lưu tin nhắn cũ sang phiên sau
-			clearRoomChatHistory(streamKey)
+			// Luồng kết thúc: Phát lệnh reset kênh chat cho client (toàn bộ tin nhắn vẫn được lưu trữ vĩnh viễn trong DB)
+			resetRoomChat(streamKey)
 		}()
 	}
 
