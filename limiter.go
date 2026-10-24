@@ -128,9 +128,26 @@ func getClientIP(r *http.Request) string {
 
 // Global rate limiters
 var (
-	loginLimiter *IPRateLimiter
-	limiterOnce  sync.Once
+	loginLimiter    *IPRateLimiter
+	registerLimiter *IPRateLimiter
+	limiterOnce     sync.Once
 )
+
+// DefaultMaxBodyBytes giới hạn kích thước request body mặc định (1 MB) chống DoS tràn RAM
+const DefaultMaxBodyBytes int64 = 1 << 20 // 1 MB
+
+// SmallJSONMaxBodyBytes giới hạn kích thước body cho các API JSON/Auth thông thường (64 KB)
+const SmallJSONMaxBodyBytes int64 = 64 * 1024 // 64 KB
+
+// limitRequestBody bọc r.Body bằng http.MaxBytesReader để chống tấn công gửi payload khổng lồ
+func limitRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
+	if r != nil && r.Body != nil {
+		if maxBytes <= 0 {
+			maxBytes = DefaultMaxBodyBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	}
+}
 
 // initRateLimiters khởi tạo các limiter từ biến môi trường
 func initRateLimiters() {
@@ -152,6 +169,16 @@ func initRateLimiters() {
 
 		rate := maxAttempts / windowSeconds
 		loginLimiter = NewIPRateLimiter(rate, maxAttempts, 5*time.Minute)
+
+		// Mặc định cho register: 5 lần đăng ký / phút / IP
+		regMax := 5.0
+		if val := os.Getenv("REGISTER_RATE_LIMIT_MAX"); val != "" {
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				regMax = v
+			}
+		}
+		regRate := regMax / windowSeconds
+		registerLimiter = NewIPRateLimiter(regRate, regMax, 5*time.Minute)
 	})
 }
 

@@ -327,6 +327,7 @@ func sysadminBotsHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(bots)
 
 	case http.MethodPost:
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			Name     string   `json:"name"`
 			Avatar   string   `json:"avatar"`
@@ -389,10 +390,11 @@ func sysadminBotsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "create_bot", r.RemoteAddr, fmt.Sprintf("Tạo mới bot tương tác '%s' (%d câu chat)", name, len(cleanMessages)))
+		recordAccessLog(claims.Username, claims.Role, "create_bot", getClientIP(r), fmt.Sprintf("Tạo mới bot tương tác '%s' (%d câu chat)", name, len(cleanMessages)))
 		json.NewEncoder(w).Encode(newBot)
 
 	case http.MethodPut:
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			ID       string   `json:"id"`
 			Name     string   `json:"name"`
@@ -444,7 +446,7 @@ func sysadminBotsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "update_bot", r.RemoteAddr, fmt.Sprintf("Cập nhật bot '%s'", req.Name))
+		recordAccessLog(claims.Username, claims.Role, "update_bot", getClientIP(r), fmt.Sprintf("Cập nhật bot '%s'", req.Name))
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Cập nhật bot thành công"})
 
 	case http.MethodDelete:
@@ -461,7 +463,7 @@ func sysadminBotsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "delete_bot", r.RemoteAddr, fmt.Sprintf("Xóa bot ID '%s'", idStr))
+		recordAccessLog(claims.Username, claims.Role, "delete_bot", getClientIP(r), fmt.Sprintf("Xóa bot ID '%s'", idStr))
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Đã xóa bot thành công"})
 
 	default:
@@ -475,6 +477,28 @@ func sysadminBotsHandler(w http.ResponseWriter, r *http.Request) {
 // GET /api/admin/bots
 func adminAvailableBotsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, err := getUserFromAuthHeader(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập để xem danh sách Bot"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Chỉ Quản trị viên mới được xem danh sách Bot"})
+		return
+	}
+
+	if botsColl == nil {
+		json.NewEncoder(w).Encode([]ChatBot{})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -520,37 +544,23 @@ func adminRoomBotsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Kiểm tra quyền sở hữu phòng nếu là admin thường
-		if claims.Role != "systemadmin" {
-			callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
-			if errID != nil {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "ID người dùng không hợp lệ"})
-				return
-			}
-			if keysColl != nil {
-				var keyDoc StreamKey
-				if errKey := keysColl.FindOne(ctx, bson.M{"key": streamKey}).Decode(&keyDoc); errKey != nil {
-					w.WriteHeader(http.StatusNotFound)
-					json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy phòng live"})
-					return
-				}
-				if keyDoc.UserID == nil || *keyDoc.UserID != callerObjID {
-					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu phòng live này"})
-					return
-				}
-			}
+		// Kiểm tra quyền sở hữu phòng nếu là admin thường (chống IDOR)
+		if !canAdminManageStreamOrSession(ctx, claims, streamKey, "") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu phòng live này"})
+			return
 		}
 
 		var assign RoomBotAssignment
-		_ = roomBotsColl.FindOne(ctx, bson.M{"stream_key": streamKey}).Decode(&assign)
+		if roomBotsColl != nil {
+			_ = roomBotsColl.FindOne(ctx, bson.M{"stream_key": streamKey}).Decode(&assign)
+		}
 
 		isRunning := globalBotManager.IsRunning(streamKey)
 
 		// Lấy chi tiết các bot đã chọn
 		selectedBots := make([]ChatBot, 0)
-		if len(assign.BotIDs) > 0 {
+		if len(assign.BotIDs) > 0 && botsColl != nil {
 			cursor, _ := botsColl.Find(ctx, bson.M{"_id": bson.M{"$in": assign.BotIDs}})
 			if cursor != nil {
 				_ = cursor.All(ctx, &selectedBots)
@@ -567,6 +577,7 @@ func adminRoomBotsHandler(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPost:
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			StreamKey string   `json:"stream_key"`
 			BotIDs    []string `json:"bot_ids"` // Tối đa 5 bot
@@ -584,26 +595,10 @@ func adminRoomBotsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// RÀNG BUỘC QUAN TRỌNG: KIỂM TRA QUYỀN SỞ HỮU PHÒNG LIVE (CHỐNG IDOR)
-		if claims.Role != "systemadmin" {
-			callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
-			if errID != nil {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "ID người dùng không hợp lệ"})
-				return
-			}
-			if keysColl != nil {
-				var keyDoc StreamKey
-				if errKey := keysColl.FindOne(ctx, bson.M{"key": streamKey}).Decode(&keyDoc); errKey != nil {
-					w.WriteHeader(http.StatusNotFound)
-					json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy phòng live"})
-					return
-				}
-				if keyDoc.UserID == nil || *keyDoc.UserID != callerObjID {
-					w.WriteHeader(http.StatusForbidden)
-					json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không có quyền gán bot vào phòng của người khác"})
-					return
-				}
-			}
+		if !canAdminManageStreamOrSession(ctx, claims, streamKey, "") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không có quyền gán bot vào phòng của người khác"})
+			return
 		}
 
 		// RÀNG BUỘC: TỐI ĐA 5 CON BOT
@@ -623,43 +618,46 @@ func adminRoomBotsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Lưu cấu hình vào MongoDB
-		upsertOpt := options.Update().SetUpsert(true)
-		_, err := roomBotsColl.UpdateOne(ctx,
-			bson.M{"stream_key": streamKey},
-			bson.M{
-				"$set": bson.M{
-					"stream_key": streamKey,
-					"admin_user": claims.Username,
-					"bot_ids":    botObjIDs,
-					"is_running": req.IsRunning,
-					"updated_at": time.Now(),
+		if roomBotsColl != nil {
+			upsertOpt := options.Update().SetUpsert(true)
+			_, err := roomBotsColl.UpdateOne(ctx,
+				bson.M{"stream_key": streamKey},
+				bson.M{
+					"$set": bson.M{
+						"stream_key": streamKey,
+						"admin_user": claims.Username,
+						"bot_ids":    botObjIDs,
+						"is_running": req.IsRunning,
+						"updated_at": time.Now(),
+					},
 				},
-			},
-			upsertOpt,
-		)
-		if err != nil {
-			http.Error(w, `{"error":"Lỗi lưu cấu hình bot phòng live"}`, http.StatusInternalServerError)
-			return
+				upsertOpt,
+			)
+			if err != nil {
+				http.Error(w, `{"error":"Lỗi lưu cấu hình bot phòng live"}`, http.StatusInternalServerError)
+				return
+			}
 		}
 
 		// Điều khiển luồng chạy bot
 		if req.IsRunning && len(botObjIDs) > 0 {
-			// Lấy danh sách thông tin bot để chạy
-			cursor, _ := botsColl.Find(ctx, bson.M{
-				"_id":       bson.M{"$in": botObjIDs},
-				"is_active": true,
-			})
 			botsToRun := make([]ChatBot, 0)
-			if cursor != nil {
-				_ = cursor.All(ctx, &botsToRun)
-				cursor.Close(ctx)
+			if botsColl != nil {
+				cursor, _ := botsColl.Find(ctx, bson.M{
+					"_id":       bson.M{"$in": botObjIDs},
+					"is_active": true,
+				})
+				if cursor != nil {
+					_ = cursor.All(ctx, &botsToRun)
+					cursor.Close(ctx)
+				}
 			}
 
 			globalBotManager.StartBots(streamKey, botsToRun)
-			recordAccessLog(claims.Username, claims.Role, "start_bots", r.RemoteAddr, fmt.Sprintf("Bật %d bot tương tác vào phòng '%s'", len(botsToRun), streamKey))
+			recordAccessLog(claims.Username, claims.Role, "start_bots", getClientIP(r), fmt.Sprintf("Bật %d bot tương tác vào phòng '%s'", len(botsToRun), streamKey))
 		} else {
 			globalBotManager.StopBots(streamKey)
-			recordAccessLog(claims.Username, claims.Role, "stop_bots", r.RemoteAddr, fmt.Sprintf("Dừng bot tương tác trong phòng '%s'", streamKey))
+			recordAccessLog(claims.Username, claims.Role, "stop_bots", getClientIP(r), fmt.Sprintf("Dừng bot tương tác trong phòng '%s'", streamKey))
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{

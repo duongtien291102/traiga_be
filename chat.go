@@ -60,20 +60,15 @@ type WSOutboundMessage struct {
 	StreamKeys  []StreamKey   `json:"stream_keys,omitempty"` // Cho auth_login_result
 }
 
-// checkWebSocketOrigin kiểm tra Origin của request theo allowlist cấu hình
-func checkWebSocketOrigin(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
+// isOriginAllowed kiểm tra xem Origin có nằm trong danh sách ALLOWED_ORIGINS hợp lệ hay không (dùng chung cho cả REST CORS và WebSocket)
+func isOriginAllowed(origin string, requestHost string) bool {
+	origin = strings.TrimSpace(origin)
 	if origin == "" {
-		if os.Getenv("ALLOW_EMPTY_ORIGIN") == "true" {
-			return true
-		}
-		log.Printf("⛔ [WS REJECT] Thiếu Header Origin từ %s", r.RemoteAddr)
 		return false
 	}
 
 	parsedOrigin, err := url.Parse(origin)
 	if err != nil || parsedOrigin.Host == "" {
-		log.Printf("⛔ [WS REJECT] Origin không hợp lệ: %s", origin)
 		return false
 	}
 
@@ -85,10 +80,13 @@ func checkWebSocketOrigin(r *http.Request) bool {
 		allowedList = []string{
 			"http://localhost:3000",
 			"http://127.0.0.1:3000",
+			"http://localhost:5173",
+			"http://127.0.0.1:5173",
 			"http://localhost:8000",
 			"http://127.0.0.1:8000",
 			"https://localhost:3000",
 			"https://127.0.0.1:3000",
+			"https://traiga-fe.vercel.app",
 		}
 	}
 
@@ -100,7 +98,7 @@ func checkWebSocketOrigin(r *http.Request) bool {
 		}
 		if item == "*" {
 			if os.Getenv("ENV") == "production" || os.Getenv("NODE_ENV") == "production" {
-				log.Println("⚠️ [WS ORIGIN] Ký tự đại diện '*' bị cấm trong production")
+				log.Println("⚠️ [ORIGIN] Ký tự đại diện '*' bị cấm trong production")
 				continue
 			}
 			return true
@@ -111,12 +109,29 @@ func checkWebSocketOrigin(r *http.Request) bool {
 	}
 
 	// Cho phép kết nối nếu cùng Host với backend hoặc reverse proxy
-	if strings.EqualFold(parsedOrigin.Host, r.Host) {
+	if requestHost != "" && strings.EqualFold(parsedOrigin.Host, requestHost) {
 		return true
 	}
 
-	log.Printf("⛔ [WS REJECT] Origin '%s' không nằm trong allowlist", origin)
 	return false
+}
+
+// checkWebSocketOrigin kiểm tra Origin của request theo allowlist cấu hình
+func checkWebSocketOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		if os.Getenv("ALLOW_EMPTY_ORIGIN") == "true" {
+			return true
+		}
+		log.Printf("⛔ [WS REJECT] Thiếu Header Origin từ %s", r.RemoteAddr)
+		return false
+	}
+
+	if !isOriginAllowed(origin, r.Host) {
+		log.Printf("⛔ [WS REJECT] Origin '%s' không nằm trong allowlist", origin)
+		return false
+	}
+	return true
 }
 
 var upgrader = websocket.Upgrader{
@@ -133,8 +148,20 @@ type ChatClient struct {
 	streamKey     string
 	username      string
 	role          string
+	clientIP      string
 	authenticated bool
 	rateLimiter   *TokenBucket
+}
+
+// getIP trả về địa chỉ IP thực của client WebSocket
+func (c *ChatClient) getIP() string {
+	if c.clientIP != "" {
+		return c.clientIP
+	}
+	if c.conn != nil && c.conn.RemoteAddr() != nil {
+		return c.conn.RemoteAddr().String()
+	}
+	return "unknown"
 }
 
 // ChatHub quản lý các phòng chat theo từng streamKey
@@ -285,6 +312,16 @@ func (c *ChatClient) readPump() {
 			var resp WSOutboundMessage
 			resp.Type = "auth_login_result"
 
+			// Áp dụng Rate Limit chống dò mật khẩu qua WebSocket
+			initRateLimiters()
+			if loginLimiter != nil && !loginLimiter.Allow(c.getIP()) {
+				resp.Error = "Quá nhiều lần thử đăng nhập từ địa chỉ này. Vui lòng thử lại sau 1 phút."
+				if b, err := json.Marshal(resp); err == nil {
+					c.send <- b
+				}
+				continue
+			}
+
 			uName := strings.ToLower(strings.TrimSpace(in.Username))
 			pwd := strings.TrimSpace(in.Password)
 
@@ -325,8 +362,9 @@ func (c *ChatClient) readPump() {
 				continue
 			}
 
-			// Tạo JWT token
+			// Tạo JWT token và đồng bộ thu hồi phiên cũ (Single-Device Session)
 			token, _ := createToken(user)
+			globalTokenRevocationStore.SetActiveUserToken(user.Username, token, time.Now().Add(7*24*time.Hour))
 
 			// Lấy các stream keys của admin này
 			var userKeys []StreamKey
@@ -367,7 +405,7 @@ func (c *ChatClient) readPump() {
 			c.role = user.Role
 			c.authenticated = true
 
-			recordAccessLog(user.Username, user.Role, "login", c.conn.RemoteAddr().String(), "Đăng nhập thành công từ Mobile Studio")
+			recordAccessLog(user.Username, user.Role, "login", c.getIP(), "Đăng nhập thành công từ Mobile Studio")
 
 			if b, err := json.Marshal(resp); err == nil {
 				c.send <- b
@@ -392,6 +430,9 @@ func (c *ChatClient) readPump() {
 			}
 
 			token, err := jwt.ParseWithClaims(tStr, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+				}
 				return jwtSecret, nil
 			})
 			if err != nil || !token.Valid {
@@ -634,6 +675,7 @@ func wsChatHandler(w http.ResponseWriter, r *http.Request) {
 		streamKey:     streamKey,
 		username:      "",
 		role:          "guest",
+		clientIP:      getClientIP(r),
 		authenticated: false,
 		rateLimiter:   NewTokenBucket(5.0, 10.0), // 5 msg/sec, burst 10
 	}

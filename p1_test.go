@@ -315,3 +315,294 @@ func TestP1_4_WebSocket_AuthHandshake(t *testing.T) {
 		t.Errorf("Guest message schema mismatch, got: %+v", parsedGuest)
 	}
 }
+
+// ==================== GIAI ĐOẠN 1, 2, 3 SECURITY HARDENING TESTS ====================
+
+// Giai đoạn 1: Kiểm tra chống IDOR trên /api/keys/toggle
+func TestPhase1_IDOR_ToggleKey(t *testing.T) {
+	// 1. Anonymous -> 401
+	t.Run("Anonymous request returns 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/keys/toggle", strings.NewReader(`{"key":"admin01","is_active":false}`))
+		w := httptest.NewRecorder()
+		toggleKeyHandler(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected 401 Unauthorized, got %d", w.Code)
+		}
+	})
+
+	// 2. IDOR: admin02 cố tình khóa key của admin01 -> 403 Forbidden
+	t.Run("Admin02 cannot toggle Admin01 key (IDOR blocked)", func(t *testing.T) {
+		tokenAdmin02 := createTestToken("admin", "admin02")
+		req := httptest.NewRequest(http.MethodPost, "/api/keys/toggle", strings.NewReader(`{"key":"admin01","is_active":false}`))
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin02)
+		w := httptest.NewRecorder()
+		toggleKeyHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden when admin02 toggles admin01's key, got %d", w.Code)
+		}
+	})
+
+	// 3. Admin01 bật/tắt key của chính mình -> 200 OK
+	t.Run("Admin01 can toggle own key", func(t *testing.T) {
+		tokenAdmin01 := createTestToken("admin", "admin01")
+		req := httptest.NewRequest(http.MethodPost, "/api/keys/toggle", strings.NewReader(`{"key":"admin01","is_active":true}`))
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin01)
+		w := httptest.NewRecorder()
+		toggleKeyHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected 200 OK when admin01 toggles own key, got %d", w.Code)
+		}
+	})
+}
+
+// Giai đoạn 1: Kiểm tra chống IDOR trên /api/sessions/replay và /api/admin/room-bots
+func TestPhase1_IDOR_ReplayAndRoomBots(t *testing.T) {
+	// 1. IDOR trên /api/sessions/replay: admin02 gắn replay cho phòng của admin01 -> 403 Forbidden
+	t.Run("Admin02 cannot manage replay for Admin01 room", func(t *testing.T) {
+		tokenAdmin02 := createTestToken("admin", "admin02")
+		body := `{"stream_key":"admin01","title":"Fake Replay","replay_url":"https://drive.google.com/file/d/1a2b3c4d5e6f7g8h9i0j/view"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/sessions/replay", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin02)
+		w := httptest.NewRecorder()
+		apiSessionReplayManageHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden for IDOR on /api/sessions/replay, got %d", w.Code)
+		}
+	})
+
+	// 2. IDOR trên GET /api/admin/room-bots: admin02 xem bot phòng của admin01 -> 403 Forbidden
+	t.Run("Admin02 cannot view room-bots of Admin01", func(t *testing.T) {
+		tokenAdmin02 := createTestToken("admin", "admin02")
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/room-bots?streamKey=admin01", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin02)
+		w := httptest.NewRecorder()
+		adminRoomBotsHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden when admin02 accesses admin01's room-bots, got %d", w.Code)
+		}
+	})
+
+	// 3. IDOR trên POST /api/admin/room-bots: admin02 bật/tắt bot phòng của admin01 -> 403 Forbidden
+	t.Run("Admin02 cannot toggle room-bots of Admin01", func(t *testing.T) {
+		tokenAdmin02 := createTestToken("admin", "admin02")
+		body := `{"stream_key":"admin01","bot_ids":[],"is_running":false}`
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/room-bots", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin02)
+		w := httptest.NewRecorder()
+		adminRoomBotsHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden when admin02 modifies admin01's room-bots, got %d", w.Code)
+		}
+	})
+}
+
+// Giai đoạn 1: Kiểm tra xác thực trên GET /api/admin/bots
+func TestPhase1_AdminBots_AuthRequired(t *testing.T) {
+	t.Run("Anonymous request to GET /api/admin/bots returns 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/bots", nil)
+		w := httptest.NewRecorder()
+		adminAvailableBotsHandler(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected 401 Unauthorized, got %d", w.Code)
+		}
+	})
+
+	t.Run("Normal user request to GET /api/admin/bots returns 403", func(t *testing.T) {
+		tokenUser := createTestToken("user", "viewer01")
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/bots", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenUser)
+		w := httptest.NewRecorder()
+		adminAvailableBotsHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden, got %d", w.Code)
+		}
+	})
+
+	t.Run("Admin request to GET /api/admin/bots returns 200", func(t *testing.T) {
+		tokenAdmin := createTestToken("admin", "admin01")
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/bots", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenAdmin)
+		w := httptest.NewRecorder()
+		adminAvailableBotsHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected 200 OK for admin, got %d", w.Code)
+		}
+	})
+}
+
+// Giai đoạn 1: Kiểm tra SRS Webhook Secret và giới hạn kích thước Body (MaxBytesReader)
+func TestPhase1_WebhookSecretAndMaxBytes(t *testing.T) {
+	os.Setenv("SRS_WEBHOOK_SECRET", "my_super_secret_srs_token_2026")
+	defer os.Unsetenv("SRS_WEBHOOK_SECRET")
+
+	// 1. Gọi /auth/unpublish không có secret -> 403 Forbidden
+	t.Run("Webhook without secret rejected with 403", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/unpublish", strings.NewReader(`{"stream":"tiendev"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		unpublishHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden without webhook secret, got %d", w.Code)
+		}
+	})
+
+	// 2. Gọi /auth/dvr với secret sai -> 403 Forbidden
+	t.Run("Webhook with wrong secret rejected with 403", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/dvr?secret=wrong_token", strings.NewReader(`{"stream":"tiendev","file":"test.mp4"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		dvrHandler(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden with wrong webhook secret, got %d", w.Code)
+		}
+	})
+
+	// 3. Gọi /auth/unpublish với secret hợp lệ qua Header -> 200 OK
+	t.Run("Webhook with valid Header secret accepted with 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/auth/unpublish", strings.NewReader(`{"stream":"tiendev"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-SRS-Webhook-Secret", "my_super_secret_srs_token_2026")
+		w := httptest.NewRecorder()
+		unpublishHandler(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected 200 OK with valid webhook secret, got %d", w.Code)
+		}
+	})
+
+	// 4. Gọi /auth/unpublish với body vượt quá 64KB -> 413 Request Entity Too Large
+	t.Run("Oversized body blocked by MaxBytesReader with 413", func(t *testing.T) {
+		hugePayload := `{"stream":"` + strings.Repeat("A", 100*1024) + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/auth/unpublish?secret=my_super_secret_srs_token_2026", strings.NewReader(hugePayload))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		unpublishHandler(w, req)
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("Expected 413 Request Entity Too Large for 100KB payload, got %d", w.Code)
+		}
+	})
+}
+
+// Giai đoạn 2: Kiểm tra Input Validation (normalizeReplayURL chống XSS & registerHandler)
+func TestPhase2_InputValidation_XSSAndRegister(t *testing.T) {
+	// 1. normalizeReplayURL phải chặn javascript:, data:, vbscript: và path traversal
+	maliciousURLs := []string{
+		"javascript:alert(document.cookie)",
+		"JAVASCRIPT:alert(1)",
+		"data:text/html,<script>alert(1)</script>",
+		"vbscript:msgbox(1)",
+		"/record/live/../../etc/passwd",
+	}
+	for _, u := range maliciousURLs {
+		norm, _ := normalizeReplayURL(u)
+		if norm != "" {
+			t.Errorf("Expected malicious replay URL %q to be rejected, but got %q", u, norm)
+		}
+	}
+
+	// Các URL hợp lệ phải được chấp nhận
+	validDrive, id := normalizeReplayURL("https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view?usp=sharing")
+	if validDrive == "" || id != "1AbCdEfGhIjKlMnOpQrStUvWxYz" {
+		t.Errorf("Expected valid Drive URL to normalize properly, got %q (id=%q)", validDrive, id)
+	}
+	validRecord, _ := normalizeReplayURL("/record/live/tiendev.1700000.mp4")
+	if validRecord != "/record/live/tiendev.1700000.mp4" {
+		t.Errorf("Expected /record/ path to be accepted, got %q", validRecord)
+	}
+
+	// 2. registerHandler: kiểm tra độ dài username/password
+	initRateLimiters()
+	registerLimiter.Reset("203.0.113.10")
+
+	t.Run("Reject short username", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"ab","password":"password123"}`))
+		req.RemoteAddr = "203.0.113.10:1234"
+		w := httptest.NewRecorder()
+		registerHandler(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 Bad Request for 2-char username, got %d", w.Code)
+		}
+	})
+
+	t.Run("Reject short password (< 6 chars)", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"validuser","password":"123"}`))
+		req.RemoteAddr = "203.0.113.10:1234"
+		w := httptest.NewRecorder()
+		registerHandler(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 Bad Request for 3-char password, got %d", w.Code)
+		}
+	})
+}
+
+// Giai đoạn 2: Kiểm tra Rate Limit trên POST /api/auth/register
+func TestPhase2_RegisterRateLimit(t *testing.T) {
+	initRateLimiters()
+	testIP := "203.0.113.55"
+	registerLimiter.Reset(testIP)
+
+	for i := 1; i <= 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"ab","password":"123"}`))
+		req.RemoteAddr = testIP + ":10000"
+		w := httptest.NewRecorder()
+		registerHandler(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("Register request %d should not be rate limited yet", i)
+		}
+	}
+
+	// Request thứ 6 từ cùng IP phải nhận 429 Too Many Requests
+	req6 := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"ab","password":"123"}`))
+	req6.RemoteAddr = testIP + ":10000"
+	w6 := httptest.NewRecorder()
+	registerHandler(w6, req6)
+	if w6.Code != http.StatusTooManyRequests {
+		t.Errorf("Expected 6th register request to return 429 Too Many Requests, got %d", w6.Code)
+	}
+}
+
+// Giai đoạn 2 & 3: Kiểm tra CORS Allowlist và HTTP Security Headers trên corsMiddleware
+func TestPhase2_3_CORSAndSecurityHeaders(t *testing.T) {
+	os.Setenv("ALLOWED_ORIGINS", "http://localhost:3000,https://traiga-fe.vercel.app")
+	defer os.Unsetenv("ALLOWED_ORIGINS")
+
+	dummyHandler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 1. Origin hợp lệ nhận được Access-Control-Allow-Origin chính xác và đầy đủ Security Headers
+	t.Run("Allowed Origin receives CORS header and Security Headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		req.Header.Set("Origin", "https://traiga-fe.vercel.app")
+		w := httptest.NewRecorder()
+		dummyHandler.ServeHTTP(w, req)
+
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://traiga-fe.vercel.app" {
+			t.Errorf("Expected Access-Control-Allow-Origin 'https://traiga-fe.vercel.app', got %q", got)
+		}
+		if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("Missing X-Content-Type-Options: nosniff header")
+		}
+		if w.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("Missing X-Frame-Options: DENY header")
+		}
+		if w.Header().Get("Strict-Transport-Security") == "" {
+			t.Errorf("Missing Strict-Transport-Security header")
+		}
+	})
+
+	// 2. Origin lạ gửi OPTIONS preflight bị từ chối với 403 Forbidden và không có wildcard *
+	t.Run("Disallowed Origin preflight rejected with 403", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/api/keys", nil)
+		req.Header.Set("Origin", "https://evil-hacker.example.com")
+		w := httptest.NewRecorder()
+		dummyHandler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected 403 Forbidden for disallowed Origin OPTIONS, got %d", w.Code)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Expected empty Access-Control-Allow-Origin for evil origin, got %q", got)
+		}
+	})
+}
+

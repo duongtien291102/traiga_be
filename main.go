@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
+	"regexp"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -369,6 +371,25 @@ func createToken(user User) (string, error) {
 	return token.SignedString(jwtSecret)
 }
 
+// verifySRSWebhookSecret xác thực Secret Token cho các SRS Webhook (/auth, /auth/unpublish, /auth/dvr)
+// Nếu biến môi trường SRS_WEBHOOK_SECRET được cấu hình, bắt buộc phải khớp qua Header X-SRS-Webhook-Secret hoặc query ?secret=
+func verifySRSWebhookSecret(r *http.Request) bool {
+	expected := strings.TrimSpace(os.Getenv("SRS_WEBHOOK_SECRET"))
+	if expected == "" {
+		return true
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-SRS-Webhook-Secret"))
+	if provided == "" {
+		provided = strings.TrimSpace(r.URL.Query().Get("secret"))
+	}
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+var validUsernameRegex = regexp.MustCompile(`^[a-z0-9_.-]{3,32}$`)
+
 // getUserFromAuthHeader trích xuất thông tin user từ Header Authorization
 func getUserFromAuthHeader(r *http.Request) (*JWTClaims, error) {
 	authHeader := r.Header.Get("Authorization")
@@ -387,6 +408,9 @@ func getUserFromAuthHeader(r *http.Request) (*JWTClaims, error) {
 	}
 
 	token, err := jwt.ParseWithClaims(tokenStr, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
 		return jwtSecret, nil
 	})
 
@@ -507,12 +531,24 @@ func unpublishHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !verifySRSWebhookSecret(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid SRS Webhook Secret"}`)
+		return
+	}
+
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var streamKey, clientAddr, appName string
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "application/json") {
 		body, err := io.ReadAll(r.Body)
-		if err == nil && len(body) > 0 {
+		if err != nil {
+			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		if len(body) > 0 {
 			var payload SRSAuthPayload
 			if err := json.Unmarshal(body, &payload); err == nil {
 				streamKey = strings.TrimSpace(payload.Stream)
@@ -541,7 +577,7 @@ func unpublishHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if clientAddr == "" {
-		clientAddr = r.RemoteAddr
+		clientAddr = getClientIP(r)
 	}
 
 	log.Printf("⏹️ [STREAM UNPUBLISH] Luồng live kết thúc - Key: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
@@ -584,17 +620,37 @@ func unpublishHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"code":0}`)
 }
 
-// corsMiddleware xử lý CORS cho Frontend
+// corsMiddleware xử lý CORS (theo danh sách ALLOWED_ORIGINS), HTTP Security Headers và giới hạn kích thước Body
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// 1. Thiết lập các HTTP Security Headers chuẩn
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+		// 2. Kiểm tra Origin theo allowlist ALLOWED_ORIGINS (không dùng *)
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			if isOriginAllowed(origin, r.Host) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			} else if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+
+		// 3. Giới hạn kích thước request body mặc định (1 MB) chống DoS
+		limitRequestBody(w, r, DefaultMaxBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -608,6 +664,19 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	initRateLimiters()
+	clientIP := getClientIP(r)
+	if registerLimiter != nil && !registerLimiter.Allow(clientIP) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "Quá nhiều yêu cầu đăng ký từ địa chỉ này. Vui lòng thử lại sau 1 phút.",
+		})
+		return
+	}
+
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -615,14 +684,34 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"Dữ liệu không hợp lệ"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"Dữ liệu không hợp lệ hoặc vượt quá dung lượng cho phép"}`, http.StatusBadRequest)
 		return
 	}
 
 	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
 	req.Password = strings.TrimSpace(req.Password)
+	req.FullName = strings.TrimSpace(req.FullName)
 	if req.Username == "" || req.Password == "" {
 		http.Error(w, `{"error":"Tên đăng nhập và mật khẩu không được để trống"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Ràng buộc độ dài và định dạng username / password (Giai đoạn 2)
+	if !validUsernameRegex.MatchString(req.Username) {
+		http.Error(w, `{"error":"Tên đăng nhập phải từ 3 đến 32 ký tự và chỉ chứa chữ cái thường, số, dấu chấm, gạch ngang hoặc gạch dưới"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Password) < 6 || len(req.Password) > 72 {
+		http.Error(w, `{"error":"Mật khẩu phải có độ dài từ 6 đến 72 ký tự"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.FullName) > 100 {
+		http.Error(w, `{"error":"Họ tên không được vượt quá 100 ký tự"}`, http.StatusBadRequest)
+		return
+	}
+
+	if usersColl == nil {
+		http.Error(w, `{"error":"Cơ sở dữ liệu chưa sẵn sàng"}`, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -663,11 +752,12 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	newUser.ID = res.InsertedID.(primitive.ObjectID)
 
-	// Ghi nhận lịch sử đăng ký
-	recordAccessLog(newUser.Username, newUser.Role, "register", r.RemoteAddr, "Đăng ký tài khoản mới")
+	// Ghi nhận lịch sử đăng ký với IP thực
+	recordAccessLog(newUser.Username, newUser.Role, "register", clientIP, "Đăng ký tài khoản mới")
 
 	// Tài khoản thông thường (role: user) KHÔNG được cấp Stream Key để livestream
 	token, _ := createToken(newUser)
+	globalTokenRevocationStore.SetActiveUserToken(newUser.Username, token, time.Now().Add(7*24*time.Hour))
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -697,6 +787,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -708,23 +799,28 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	if usersColl == nil {
+		http.Error(w, `{"error":"Cơ sở dữ liệu chưa sẵn sàng"}`, http.StatusServiceUnavailable)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	var user User
 	err := usersColl.FindOne(ctx, bson.M{"username": req.Username}).Decode(&user)
 	if err != nil {
-		recordAccessLog(req.Username, "guest", "login_failed", r.RemoteAddr, "Đăng nhập thất bại: Tài khoản không tồn tại")
+		recordAccessLog(req.Username, "guest", "login_failed", clientIP, "Đăng nhập thất bại: Tài khoản không tồn tại")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Tài khoản không tồn tại"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Tên đăng nhập hoặc mật khẩu không chính xác"})
 		return
 	}
 
-	// Kiểm tra mật khẩu
+	// Kiểm tra mật khẩu (gộp chung thông báo lỗi để chống dò danh sách username)
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
-		recordAccessLog(req.Username, user.Role, "login_failed", r.RemoteAddr, "Đăng nhập thất bại: Sai mật khẩu")
+		recordAccessLog(req.Username, user.Role, "login_failed", clientIP, "Đăng nhập thất bại: Sai mật khẩu")
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Mật khẩu không chính xác"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Tên đăng nhập hoặc mật khẩu không chính xác"})
 		return
 	}
 
@@ -737,8 +833,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	// Thu hồi phiên đăng nhập cũ của cùng tài khoản (chỉ cho phép 1 thiết bị đăng nhập tại 1 thời điểm)
 	globalTokenRevocationStore.SetActiveUserToken(user.Username, token, time.Now().Add(7*24*time.Hour))
 
-	// Ghi nhận lịch sử đăng nhập thành công
-	recordAccessLog(user.Username, user.Role, "login", r.RemoteAddr, fmt.Sprintf("Đăng nhập thành công với vai trò '%s'", user.Role))
+	// Ghi nhận lịch sử đăng nhập thành công với IP thực
+	recordAccessLog(user.Username, user.Role, "login", clientIP, fmt.Sprintf("Đăng nhập thành công với vai trò '%s'", user.Role))
 
 	// CHỈ CẤP STREAM KEY NẾU LÀ ADMIN (SystemAdmin & User TUYỆT ĐỐI KHÔNG CÓ STREAM KEY)
 	streamKeyStr := ""
@@ -823,7 +919,7 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		globalTokenRevocationStore.RevokeToken(tokenStr, time.Now().Add(24*time.Hour))
 	}
 
-	recordAccessLog(username, role, "logout", r.RemoteAddr, "Đăng xuất khỏi hệ thống và thu hồi token")
+	recordAccessLog(username, role, "logout", getClientIP(r), "Đăng xuất khỏi hệ thống và thu hồi token")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Đã ghi nhận đăng xuất"})
 }
@@ -939,12 +1035,18 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// Tạo key mới (DÀNH CHO ADMIN HOẶC SYSTEMADMIN)
 		claims, err := getUserFromAuthHeader(r)
-		if err != nil || (claims.Role != "admin" && claims.Role != "systemadmin") {
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
+			return
+		}
+		if claims.Role != "admin" && claims.Role != "systemadmin" {
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ tài khoản Admin hoặc SystemAdmin mới có quyền tạo Stream Key"})
 			return
 		}
 
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			Key           string `json:"key"`
 			Title         string `json:"title"`
@@ -1032,7 +1134,7 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		newKey.ID = res.InsertedID.(primitive.ObjectID)
 
-		recordAccessLog(claims.Username, claims.Role, "create_key", r.RemoteAddr,
+		recordAccessLog(claims.Username, claims.Role, "create_key", getClientIP(r),
 			fmt.Sprintf("Tạo khóa luồng mới '%s' cho Streamer '%s'", newKey.Key, newKey.Streamer))
 
 		w.WriteHeader(http.StatusCreated)
@@ -1106,7 +1208,7 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "delete_key", r.RemoteAddr,
+		recordAccessLog(claims.Username, claims.Role, "delete_key", getClientIP(r),
 			fmt.Sprintf("Xóa khóa luồng '%s'", keyParam))
 
 		json.NewEncoder(w).Encode(map[string]string{"message": "Đã xóa Stream Key thành công"})
@@ -1116,20 +1218,27 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// toggleKeyHandler cho phép Admin và SystemAdmin bật/tắt (khoá/mở khoá) bất kỳ Stream Key nào
+// toggleKeyHandler cho phép Admin bật/tắt Stream Key của chính mình (hoặc SystemAdmin bật/tắt mọi Stream Key)
 func toggleKeyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	claims, err := getUserFromAuthHeader(r)
-	if err != nil || (claims.Role != "admin" && claims.Role != "systemadmin") {
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Quản trị viên (Admin hoặc SystemAdmin) mới có quyền bật/tắt Key"})
 		return
 	}
 
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var req struct {
 		Key      string `json:"key"`
 		IsActive bool   `json:"is_active"`
@@ -1140,16 +1249,46 @@ func toggleKeyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err = keysColl.UpdateOne(ctx, bson.M{"key": req.Key}, bson.M{"$set": bson.M{"is_active": req.IsActive}})
-	if err != nil {
-		http.Error(w, `{"error":"Lỗi cập nhật"}`, http.StatusInternalServerError)
+	req.Key = strings.TrimSpace(req.Key)
+	if req.Key == "" {
+		http.Error(w, `{"error":"Thiếu tham số key"}`, http.StatusBadRequest)
 		return
 	}
 
-	recordAccessLog(claims.Username, claims.Role, "toggle_key", r.RemoteAddr,
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Kiểm tra quyền sở hữu Stream Key (chống IDOR: tránh admin02 khóa key của admin01)
+	if keysColl != nil {
+		var targetKey StreamKey
+		if errFind := keysColl.FindOne(ctx, bson.M{"key": req.Key}).Decode(&targetKey); errFind != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa luồng"})
+			return
+		}
+		if claims.Role != "systemadmin" {
+			callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
+			if errID != nil || targetKey.UserID == nil || *targetKey.UserID != callerObjID {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
+				return
+			}
+		}
+
+		_, err = keysColl.UpdateOne(ctx, bson.M{"_id": targetKey.ID}, bson.M{"$set": bson.M{"is_active": req.IsActive}})
+		if err != nil {
+			http.Error(w, `{"error":"Lỗi cập nhật"}`, http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if !canAdminManageStreamOrSession(ctx, claims, req.Key, "") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
+			return
+		}
+	}
+
+	recordAccessLog(claims.Username, claims.Role, "toggle_key", getClientIP(r),
 		fmt.Sprintf("Cập nhật trạng thái khóa '%s' thành %v", req.Key, req.IsActive))
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1345,6 +1484,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		// SystemAdmin tạo tài khoản mới (Admin hoặc User)
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			Username  string `json:"username"`
 			Password  string `json:"password"`
@@ -1434,7 +1574,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "create_user", r.RemoteAddr,
+		recordAccessLog(claims.Username, claims.Role, "create_user", getClientIP(r),
 			fmt.Sprintf("Tạo tài khoản '%s' với quyền '%s'", newUser.Username, newUser.Role))
 
 		w.WriteHeader(http.StatusCreated)
@@ -1446,6 +1586,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPatch:
 		// Đổi Role cho tài khoản
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			Username string `json:"username"`
 			Role     string `json:"role"` // "admin" hoặc "user"
@@ -1497,7 +1638,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		recordAccessLog(claims.Username, claims.Role, "change_role", r.RemoteAddr,
+		recordAccessLog(claims.Username, claims.Role, "change_role", getClientIP(r),
 			fmt.Sprintf("Đổi quyền tài khoản '%s' thành '%s'", req.Username, req.Role))
 
 		json.NewEncoder(w).Encode(map[string]string{"message": "Đã cập nhật vai trò thành công!"})
@@ -1537,7 +1678,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 			// Xóa user
 			_, _ = usersColl.DeleteOne(ctx, bson.M{"_id": targetUser.ID})
 
-			recordAccessLog(claims.Username, claims.Role, "delete_user", r.RemoteAddr,
+			recordAccessLog(claims.Username, claims.Role, "delete_user", getClientIP(r),
 				fmt.Sprintf("Xóa tài khoản '%s' (Vai trò: %s)", targetUser.Username, targetUser.Role))
 
 			json.NewEncoder(w).Encode(map[string]string{"message": "Đã xóa tài khoản và khóa luồng liên quan thành công!"})
@@ -1719,13 +1860,25 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !verifySRSWebhookSecret(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid SRS Webhook Secret"}`)
+		return
+	}
+
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var streamKey, clientAddr, appName string
 	contentType := r.Header.Get("Content-Type")
 
 	// 1. Parse JSON từ SRS Media Server
 	if strings.Contains(contentType, "application/json") {
 		body, err := io.ReadAll(r.Body)
-		if err == nil && len(body) > 0 {
+		if err != nil {
+			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		if len(body) > 0 {
 			var payload SRSAuthPayload
 			if err := json.Unmarshal(body, &payload); err == nil {
 				streamKey = strings.TrimSpace(payload.Stream)
@@ -1751,11 +1904,14 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 			if appName == "" {
 				appName = r.FormValue("app")
 			}
+		} else if strings.Contains(err.Error(), "http: request body too large") {
+			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
+			return
 		}
 	}
 
 	if clientAddr == "" {
-		clientAddr = r.RemoteAddr
+		clientAddr = getClientIP(r)
 	}
 
 	// Kiểm tra tính hợp lệ và đang hoạt động trong MongoDB

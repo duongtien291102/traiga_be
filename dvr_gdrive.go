@@ -21,8 +21,10 @@ import (
 )
 
 var driveFileIDRegex = regexp.MustCompile(`(?:/d/|id=)([a-zA-Z0-9_-]{15,})`)
+var pureDriveIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{20,}$`)
 
-// normalizeReplayURL chuẩn hóa link Google Drive (share link -> /preview embed link) hoặc giữ nguyên link .mp4
+// normalizeReplayURL chuẩn hóa link Google Drive (share link -> /preview embed link) hoặc giữ nguyên link .mp4 hợp lệ.
+// Chặn triệt để các URI scheme nguy hiểm (javascript:, data:, vbscript:, file:...) để phòng chống Stored XSS.
 func normalizeReplayURL(raw string) (string, string) {
 	clean := strings.TrimSpace(raw)
 	if clean == "" {
@@ -32,9 +34,22 @@ func normalizeReplayURL(raw string) (string, string) {
 		fileID := matches[1]
 		return fmt.Sprintf("https://drive.google.com/file/d/%s/preview", fileID), fileID
 	}
-	// Nếu chỉ truyền thẳng Google Drive File ID (không chứa dấu / hay :)
-	if !strings.Contains(clean, "/") && !strings.Contains(clean, ":") && len(clean) >= 20 {
+	// Nếu chỉ truyền thẳng Google Drive File ID (chỉ gồm chữ, số, _, - và >= 20 ký tự)
+	if pureDriveIDRegex.MatchString(clean) {
 		return fmt.Sprintf("https://drive.google.com/file/d/%s/preview", clean), clean
+	}
+	// Cho phép đường dẫn nội bộ /record/... (không chứa ..)
+	if strings.HasPrefix(clean, "/record/") && !strings.Contains(clean, "..") {
+		return clean, ""
+	}
+	// Chỉ cho phép URL có scheme http:// hoặc https:// hợp lệ
+	parsed, err := url.Parse(clean)
+	if err != nil || parsed.Host == "" {
+		return "", ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return "", ""
 	}
 	return clean, ""
 }
@@ -185,6 +200,44 @@ func uploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 	return uploadedFile.ID, previewURL, nil
 }
 
+// canAdminManageStreamOrSession kiểm tra quyền sở hữu StreamKey/Session để chống lỗ hổng IDOR giữa các Admin
+func canAdminManageStreamOrSession(ctx context.Context, claims *JWTClaims, streamKey string, streamer string) bool {
+	if claims == nil {
+		return false
+	}
+	if claims.Role == "systemadmin" {
+		return true
+	}
+	if claims.Role != "admin" {
+		return false
+	}
+
+	callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
+
+	// Nếu có kết nối keysColl, kiểm tra chủ sở hữu của streamKey
+	if keysColl != nil && streamKey != "" {
+		var keyDoc StreamKey
+		if err := keysColl.FindOne(ctx, bson.M{"key": streamKey}).Decode(&keyDoc); err == nil {
+			if errID == nil && keyDoc.UserID != nil && *keyDoc.UserID == callerObjID {
+				return true
+			}
+			if keyDoc.UserID == nil && strings.EqualFold(keyDoc.Streamer, claims.Username) {
+				return true
+			}
+			return false
+		}
+	}
+
+	// Kiểm tra theo username của Admin
+	if streamKey != "" && strings.EqualFold(streamKey, claims.Username) {
+		return true
+	}
+	if streamer != "" && strings.EqualFold(streamer, claims.Username) {
+		return true
+	}
+	return false
+}
+
 // dvrHandler nhận webhook on_dvr từ SRS khi file .mp4 ghi hình hoàn tất
 func dvrHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -192,9 +245,21 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !verifySRSWebhookSecret(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid SRS Webhook Secret"}`)
+		return
+	}
+
+	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var payload SRSAuthPayload
 	body, err := io.ReadAll(r.Body)
-	if err == nil && len(body) > 0 {
+	if err != nil {
+		http.Error(w, `{"error":"Payload too large or invalid"}`, http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(body) > 0 {
 		_ = json.Unmarshal(body, &payload)
 	}
 
@@ -397,22 +462,17 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	mongoMutex.RLock()
 	ready := isMongoReady
 	coll := sessionsColl
 	mongoMutex.RUnlock()
 
-	if !ready || coll == nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Database chưa sẵn sàng"})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	switch r.Method {
 	case http.MethodPost, http.MethodPut:
+		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 		var req struct {
 			SessionID string `json:"session_id"`
 			StreamKey string `json:"stream_key"`
@@ -421,14 +481,27 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Dữ liệu không hợp lệ"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "Dữ liệu không hợp lệ hoặc vượt quá giới hạn dung lượng"})
 			return
 		}
 
 		normalizedURL, driveID := normalizeReplayURL(req.ReplayURL)
 		if normalizedURL == "" {
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Vui lòng nhập đường dẫn Google Drive hoặc link video hợp lệ"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "Vui lòng nhập đường dẫn Google Drive hoặc link video hợp lệ (http/https)"})
+			return
+		}
+
+		streamKey := strings.TrimSpace(req.StreamKey)
+		if streamKey != "" && !canAdminManageStreamOrSession(ctx, claims, streamKey, "") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu phòng live này"})
+			return
+		}
+
+		if !ready || coll == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database chưa sẵn sàng"})
 			return
 		}
 
@@ -437,7 +510,7 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 			recordStatus = "uploaded_drive"
 		}
 
-		// Nếu có truyền session_id -> Cập nhật vào session đó
+		// Nếu có truyền session_id -> Kiểm tra quyền sở hữu (IDOR) rồi mới cập nhật vào session đó
 		if strings.TrimSpace(req.SessionID) != "" {
 			objID, errID := primitive.ObjectIDFromHex(strings.TrimSpace(req.SessionID))
 			if errID != nil {
@@ -445,6 +518,20 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 				json.NewEncoder(w).Encode(map[string]string{"error": "session_id không hợp lệ"})
 				return
 			}
+
+			var targetSession LiveSession
+			if errFind := coll.FindOne(ctx, bson.M{"_id": objID}).Decode(&targetSession); errFind != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy phiên live"})
+				return
+			}
+
+			if !canAdminManageStreamOrSession(ctx, claims, targetSession.StreamKey, targetSession.Streamer) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu bản ghi phiên live này"})
+				return
+			}
+
 			updateFields := bson.M{
 				"replay_url":    normalizedURL,
 				"drive_file_id": driveID,
@@ -467,7 +554,6 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Nếu không có session_id -> Tạo mới 1 bản ghi phát lại
-		streamKey := strings.TrimSpace(req.StreamKey)
 		if streamKey == "" {
 			streamKey = claims.Username
 		}
@@ -508,6 +594,26 @@ func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "ID không hợp lệ"})
 			return
 		}
+
+		if !ready || coll == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database chưa sẵn sàng"})
+			return
+		}
+
+		var targetSession LiveSession
+		if errFind := coll.FindOne(ctx, bson.M{"_id": objID}).Decode(&targetSession); errFind != nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy phiên live"})
+			return
+		}
+
+		if !canAdminManageStreamOrSession(ctx, claims, targetSession.StreamKey, targetSession.Streamer) {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không có quyền xóa bản ghi của người khác"})
+			return
+		}
+
 		_, _ = coll.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{
 			"$unset": bson.M{
 				"replay_url":    "",
