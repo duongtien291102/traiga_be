@@ -39,19 +39,35 @@ type User struct {
 
 // StreamKey đại diện cho bảng stream_keys trong MongoDB
 type StreamKey struct {
-	ID        primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Key       string              `bson:"key" json:"key"`                               // Mã Stream Key
-	Title     string              `bson:"title" json:"title"`                           // Tiêu đề phòng live
-	Streamer  string              `bson:"streamer" json:"streamer"`                     // Tên hiển thị của streamer
-	UserID    *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`   // ID của user sở hữu
-	IsActive  bool                `bson:"is_active" json:"is_active"`                   // Bật/tắt quyền phát
-	MS        string              `bson:"ms,omitempty" json:"ms,omitempty"`             // Mã số chiến kê
-	Chang     string              `bson:"chang,omitempty" json:"chang,omitempty"`       // Chạng cân
-	Loi       string              `bson:"loi,omitempty" json:"loi,omitempty"`           // Lối đá
-	CanVay    string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"`   // Cán vảy
-	DatNuoc   string              `bson:"dat_nuoc,omitempty" json:"dat_nuoc,omitempty"` // Đạt nước
-	Thumb     string              `bson:"thumb,omitempty" json:"thumb,omitempty"`       // Ảnh đại diện
-	CreatedAt time.Time           `bson:"created_at" json:"created_at"`
+	ID                     primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
+	Key                    string              `bson:"key" json:"key"` // Public room identifier, not an ingest credential.
+	PublishSecret          string              `bson:"-" json:"-"`
+	PublishSecretEncrypted string              `bson:"publish_secret_enc,omitempty" json:"-"`
+	PublishSecretHash      string              `bson:"publish_secret_hash,omitempty" json:"-"`
+	Title                  string              `bson:"title" json:"title"`
+	Streamer               string              `bson:"streamer" json:"streamer"`
+	UserID                 *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`
+	IsActive               bool                `bson:"is_active" json:"is_active"`
+	MS                     string              `bson:"ms,omitempty" json:"ms,omitempty"`
+	Chang                  string              `bson:"chang,omitempty" json:"chang,omitempty"`
+	Loi                    string              `bson:"loi,omitempty" json:"loi,omitempty"`
+	CanVay                 string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"`
+	DatNuoc                string              `bson:"dat_nuoc,omitempty" json:"dat_nuoc,omitempty"`
+	Thumb                  string              `bson:"thumb,omitempty" json:"thumb,omitempty"`
+	CreatedAt              time.Time           `bson:"created_at" json:"created_at"`
+}
+
+type StreamKeyCredential struct {
+	StreamKey
+	PublishSecret string `json:"publish_secret"`
+}
+
+func streamKeyCredentials(keys []StreamKey) []StreamKeyCredential {
+	credentials := make([]StreamKeyCredential, 0, len(keys))
+	for _, key := range keys {
+		credentials = append(credentials, StreamKeyCredential{StreamKey: key, PublishSecret: key.PublishSecret})
+	}
+	return credentials
 }
 
 // LiveSession lưu trữ phiên live và đường dẫn video xem lại (Google Drive / SRS DVR)
@@ -170,12 +186,25 @@ func ensureAdminStreamKeys(ctx context.Context, user User) ([]StreamKey, error) 
 	_ = cursor.Close(ctx)
 
 	for i := range keys {
+		if keys[i].PublishSecret == "" {
+			if err := hydratePublishSecret(&keys[i]); err != nil {
+				return nil, fmt.Errorf("không thể mở khóa phát của phòng %s: %w", keys[i].ID.Hex(), err)
+			}
+		}
 		if strings.EqualFold(keys[i].Key, user.Username) {
 			newKey, err := generateStreamKey()
 			if err != nil {
 				return nil, err
 			}
-			if _, err := keysColl.UpdateOne(ctx, bson.M{"_id": keys[i].ID}, bson.M{"$set": bson.M{"key": newKey}}); err != nil {
+			storedKey, err := streamKeyForStorage(keys[i])
+			if err != nil {
+				return nil, err
+			}
+			if _, err := keysColl.UpdateOne(ctx, bson.M{"_id": keys[i].ID}, bson.M{"$set": bson.M{
+				"key":                 newKey,
+				"publish_secret_enc":  storedKey.PublishSecretEncrypted,
+				"publish_secret_hash": storedKey.PublishSecretHash,
+			}}); err != nil {
 				return nil, err
 			}
 			keys[i].Key = newKey
@@ -188,10 +217,15 @@ func ensureAdminStreamKeys(ctx context.Context, user User) ([]StreamKey, error) 
 			return nil, err
 		}
 		key := StreamKey{Key: newKey, Title: fmt.Sprintf("Kênh %s", user.FullName), Streamer: user.FullName, UserID: &user.ID, IsActive: true, CreatedAt: time.Now()}
-		result, err := keysColl.InsertOne(ctx, key)
+		storedKey, err := streamKeyForStorage(key)
 		if err != nil {
 			return nil, err
 		}
+		result, err := keysColl.InsertOne(ctx, storedKey)
+		if err != nil {
+			return nil, err
+		}
+		key = storedKey
 		key.ID = result.InsertedID.(primitive.ObjectID)
 		keys = append(keys, key)
 	}
@@ -212,6 +246,12 @@ func initJWTSecret() {
 func initMongoDB() {
 	_ = godotenv.Load()
 	initJWTSecret()
+	if err := initStreamKeyCrypto(); err != nil {
+		log.Fatalf("❌ FATAL SECURITY ERROR: %v", err)
+	}
+	if strings.TrimSpace(os.Getenv("STREAM_KEY_ENCRYPTION_KEY")) == "" {
+		log.Println("⚠️ STREAM_KEY_ENCRYPTION_KEY chưa được đặt; publish secret đang dùng khóa dẫn xuất từ JWT_SECRET. Hãy cấu hình khóa riêng và giữ ổn định qua các lần triển khai.")
+	}
 
 	uri := os.Getenv("MONGO_URI")
 	dbName := os.Getenv("MONGO_DB")
@@ -289,6 +329,11 @@ func initMongoDB() {
 
 	// Khởi tạo tài khoản System Admin & Admin mặc định và key mẫu
 	seedDefaultData()
+	secretCtx, secretCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer secretCancel()
+	if err := migratePublishSecrets(secretCtx); err != nil {
+		log.Fatalf("❌ Không thể khởi tạo mã bảo vệ khóa phát: %v", err)
+	}
 }
 
 // recordAccessLog lưu vết sự kiện đăng nhập, đăng xuất, phiên live và hoạt động quản trị
@@ -535,7 +580,7 @@ func getUserFromAuthHeader(r *http.Request) (*JWTClaims, error) {
 
 // verifyStreamKey kiểm tra Stream Key hợp lệ trong MongoDB và bắt buộc chủ sở hữu phải có role == "admin"
 // TÀI KHOẢN SYSTEMADMIN VÀ USER BÌNH THƯỜNG TUYỆT ĐỐI KHÔNG ĐƯỢC PHÉP LIVESTREAM
-func verifyStreamKey(streamKey string) bool {
+func verifyStreamKey(streamKey, publishSecret string) bool {
 	mongoMutex.RLock()
 	ready := isMongoReady
 	coll := keysColl
@@ -549,7 +594,11 @@ func verifyStreamKey(streamKey string) bool {
 		var keyDoc StreamKey
 		err := coll.FindOne(ctx, bson.M{"key": streamKey, "is_active": true}).Decode(&keyDoc)
 		if err != nil {
-			log.Printf("⛔ [AUTH BLOCKED] Stream Key '%s' không tồn tại hoặc đã bị khóa", streamKey)
+			log.Printf("⛔ [AUTH BLOCKED] Phòng '%s' không tồn tại hoặc đã bị khóa", streamKey)
+			return false
+		}
+		if !publishSecretMatches(publishSecret, keyDoc.PublishSecretHash) {
+			log.Printf("⛔ [AUTH BLOCKED] Sai publish secret cho phòng '%s'", streamKey)
 			return false
 		}
 
@@ -558,37 +607,89 @@ func verifyStreamKey(streamKey string) bool {
 			var u User
 			if err := uColl.FindOne(ctx, bson.M{"_id": keyDoc.UserID}).Decode(&u); err == nil {
 				if u.Role == "systemadmin" {
-					log.Printf("⛔ [AUTH REJECTED] Khóa '%s' thuộc tài khoản SystemAdmin '%s'. Tài khoản SystemAdmin TUYỆT ĐỐI KHÔNG ĐƯỢC PHÉP LIVESTREAM!", streamKey, u.Username)
+					log.Printf("⛔ [AUTH REJECTED] Phòng '%s' thuộc tài khoản SystemAdmin '%s'. Tài khoản SystemAdmin TUYỆT ĐỐI KHÔNG ĐƯỢC PHÉP LIVESTREAM!", streamKey, u.Username)
 					return false
 				}
 				if u.Role != "admin" {
-					log.Printf("⛔ [AUTH REJECTED] Khóa '%s' thuộc user '%s' (role: '%s'). Chỉ tài khoản role 'admin' mới được livestream!", streamKey, u.Username, u.Role)
+					log.Printf("⛔ [AUTH REJECTED] Phòng '%s' thuộc user '%s' (role: '%s'). Chỉ tài khoản role 'admin' mới được livestream!", streamKey, u.Username, u.Role)
 					return false
 				}
-				log.Printf("👑 [AUTH APPROVED] Admin '%s' đang phát sóng với Stream Key '%s'", u.Username, streamKey)
+				log.Printf("👑 [AUTH APPROVED] Admin '%s' đang phát sóng phòng '%s'", u.Username, streamKey)
 				return true
 			}
-			log.Printf("⛔ [AUTH BLOCKED] Không tìm thấy tài khoản sở hữu khóa '%s'", streamKey)
+			log.Printf("⛔ [AUTH BLOCKED] Không tìm thấy tài khoản sở hữu phòng '%s'", streamKey)
 			return false
 		}
 
-		// Cho phép các key quản trị viên mặc định
-		if strings.HasPrefix(streamKey, "thanhtrung") || streamKey == "tiendev" || streamKey == "supersecret" || streamKey == "test" {
-			log.Printf("👑 [AUTH APPROVED] Chấp nhận key quản trị mặc định: '%s'", streamKey)
-			return true
+		// Legacy key records may not have user_id; resolve their streamer label
+		// against the accounts table, but still require the secret above.
+		if keyDoc.Streamer != "" {
+			var owner User
+			ownerName := strings.ToLower(strings.TrimSpace(keyDoc.Streamer))
+			ownerErr := uColl.FindOne(ctx, bson.M{"username": ownerName}).Decode(&owner)
+			if ownerErr != nil {
+				ownerErr = uColl.FindOne(ctx, bson.M{"full_name": keyDoc.Streamer}).Decode(&owner)
+			}
+			if ownerErr == nil && owner.Role == "admin" {
+				log.Printf("👑 [AUTH APPROVED] Admin '%s' đang phát sóng phòng '%s'", owner.Username, streamKey)
+				return true
+			}
 		}
-
-		log.Printf("⛔ [AUTH BLOCKED] Stream Key '%s' không thuộc tài khoản Admin nào", streamKey)
+		log.Printf("⛔ [AUTH BLOCKED] Phòng '%s' không thuộc tài khoản Admin nào", streamKey)
 		return false
 	}
 
-	// Fallback nếu DB offline
-	fallback := map[string]bool{
-		"thanhtrung01": true, "thanhtrung02": true, "thanhtrung03": true, "thanhtrung04": true,
-		"thanhtrung05": true, "thanhtrung06": true, "thanhtrung07": true, "thanhtrung08": true,
-		"tiendev": true, "supersecret": true, "test": true,
+	// Fail closed when the credential store is unavailable. Static default
+	// room names are public identifiers and must never authorize publishing.
+	log.Printf("⛔ [AUTH BLOCKED] Không thể xác thực phòng '%s' khi cơ sở dữ liệu không sẵn sàng", streamKey)
+	return false
+}
+
+// verifyInternalABRStream only allows loopback FFmpeg publishers to publish
+// generated renditions, and only for an existing active room owned by an admin.
+func verifyInternalABRStream(app, streamKey, clientIP string) bool {
+	if app != "abr" || (clientIP != "127.0.0.1" && clientIP != "::1" && clientIP != "localhost") {
+		return false
 	}
-	return fallback[streamKey]
+
+	roomKey := ""
+	for _, suffix := range []string{"_720p", "_480p", "_360p"} {
+		if strings.HasSuffix(streamKey, suffix) {
+			roomKey = strings.TrimSuffix(streamKey, suffix)
+			break
+		}
+	}
+	if roomKey == "" {
+		return false
+	}
+
+	mongoMutex.RLock()
+	ready, coll, uColl := isMongoReady, keysColl, usersColl
+	mongoMutex.RUnlock()
+	if !ready || coll == nil || uColl == nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var room StreamKey
+	if err := coll.FindOne(ctx, bson.M{"key": roomKey, "is_active": true}).Decode(&room); err != nil {
+		return false
+	}
+	var owner User
+	if room.UserID != nil {
+		if err := uColl.FindOne(ctx, bson.M{"_id": room.UserID}).Decode(&owner); err != nil {
+			return false
+		}
+	} else {
+		name := strings.ToLower(strings.TrimSpace(room.Streamer))
+		if err := uColl.FindOne(ctx, bson.M{"username": name}).Decode(&owner); err != nil {
+			if err := uColl.FindOne(ctx, bson.M{"full_name": room.Streamer}).Decode(&owner); err != nil {
+				return false
+			}
+		}
+	}
+	return owner.Role == "admin"
 }
 
 // recordLiveSession ghi nhận phiên live mới và chốt các phiên cũ chưa đóng
@@ -692,6 +793,12 @@ func unpublishHandler(w http.ResponseWriter, r *http.Request) {
 
 	if clientAddr == "" {
 		clientAddr = getClientIP(r)
+	}
+	if appName == "abr" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"code":0}`)
+		return
 	}
 
 	log.Printf("⏹️ [STREAM UNPUBLISH] Luồng live kết thúc - Key: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
@@ -955,6 +1062,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	// CHỈ CẤP STREAM KEY NẾU LÀ ADMIN (SystemAdmin & User TUYỆT ĐỐI KHÔNG CÓ STREAM KEY)
 	streamKeyStr := ""
+	publishSecretStr := ""
 	var userKeys []StreamKey
 	if user.Role == "admin" {
 		userKeys, err = ensureAdminStreamKeys(ctx, user)
@@ -965,17 +1073,19 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		for _, key := range userKeys {
 			if key.IsActive {
 				streamKeyStr = key.Key
+				publishSecretStr = key.PublishSecret
 				break
 			}
 		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":     "Đăng nhập thành công!",
-		"token":       token,
-		"user":        user,
-		"stream_key":  streamKeyStr,
-		"stream_keys": userKeys,
+		"message":        "Đăng nhập thành công!",
+		"token":          token,
+		"user":           user,
+		"stream_key":     streamKeyStr,
+		"publish_secret": publishSecretStr,
+		"stream_keys":    streamKeyCredentials(userKeys),
 	})
 }
 
@@ -1032,6 +1142,7 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Chỉ cấp stream_key nếu là admin
 	streamKeyStr := ""
+	publishSecretStr := ""
 	var userKeys []StreamKey
 	if user.Role == "admin" {
 		user.ID = objID
@@ -1043,15 +1154,17 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 		for _, key := range userKeys {
 			if key.IsActive {
 				streamKeyStr = key.Key
+				publishSecretStr = key.PublishSecret
 				break
 			}
 		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"user":        user,
-		"stream_key":  streamKeyStr,
-		"stream_keys": userKeys,
+		"user":           user,
+		"stream_key":     streamKeyStr,
+		"publish_secret": publishSecretStr,
+		"stream_keys":    streamKeyCredentials(userKeys),
 	})
 }
 
@@ -1359,14 +1472,12 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 		newKey.IsActive = true
 		newKey.CreatedAt = time.Now()
 
-		res, err := keysColl.InsertOne(ctx, newKey)
-		if err != nil {
+		newKey, insertErr := insertStreamKey(ctx, newKey)
+		if insertErr != nil {
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Stream Key này đã tồn tại!"})
 			return
 		}
-		newKey.ID = res.InsertedID.(primitive.ObjectID)
-
 		recordAccessLog(claims.Username, claims.Role, "create_key", getClientIP(r),
 			fmt.Sprintf("Tạo khóa luồng mới '%s' cho Streamer '%s'", newKey.Key, newKey.Streamer))
 
@@ -1449,6 +1560,63 @@ func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// revealPublishSecretHandler only returns the decrypted credential after an
+// authenticated owner explicitly requests it. List APIs never include it.
+func revealPublishSecretHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	claims, err := getUserFromAuthHeader(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Admin mới được xem khóa phát"})
+		return
+	}
+	if keysColl == nil {
+		http.Error(w, `{"error":"Cơ sở dữ liệu chưa sẵn sàng"}`, http.StatusServiceUnavailable)
+		return
+	}
+	id, err := primitive.ObjectIDFromHex(strings.TrimSpace(r.URL.Query().Get("id")))
+	if err != nil {
+		http.Error(w, `{"error":"ID khóa không hợp lệ"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	targetKey, err := findStreamKeyByID(ctx, id)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa phát"})
+		return
+	}
+	if claims.Role != "systemadmin" {
+		callerID, errID := primitive.ObjectIDFromHex(claims.UserID)
+		ownsKey := errID == nil && targetKey.UserID != nil && *targetKey.UserID == callerID
+		if !ownsKey && targetKey.UserID == nil {
+			ownsKey = strings.EqualFold(targetKey.Streamer, claims.Username)
+		}
+		if !ownsKey {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Bạn không sở hữu khóa phát này"})
+			return
+		}
+	}
+	if err := hydratePublishSecret(&targetKey); err != nil {
+		http.Error(w, `{"error":"Không thể mở khóa phát"}`, http.StatusInternalServerError)
+		return
+	}
+	recordAccessLog(claims.Username, claims.Role, "reveal_publish_secret", getClientIP(r), fmt.Sprintf("Xem khóa phát của phòng '%s'", targetKey.Key))
+	json.NewEncoder(w).Encode(map[string]string{"publish_secret": targetKey.PublishSecret})
 }
 
 // toggleKeyHandler cho phép Admin bật/tắt Stream Key của chính mình (hoặc SystemAdmin bật/tắt mọi Stream Key)
@@ -1804,9 +1972,8 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 				IsActive:  true,
 				CreatedAt: time.Now(),
 			}
-			resK, errK := keysColl.InsertOne(ctx, adminKey)
+			adminKey, errK := insertStreamKey(ctx, adminKey)
 			if errK == nil {
-				adminKey.ID = resK.InsertedID.(primitive.ObjectID)
 				createdKey = &adminKey
 			}
 		}
@@ -1876,7 +2043,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 					IsActive:  true,
 					CreatedAt: time.Now(),
 				}
-				_, _ = keysColl.InsertOne(ctx, newKey)
+				_, _ = insertStreamKey(ctx, newKey)
 			}
 		}
 
@@ -2110,7 +2277,7 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
-	var streamKey, clientAddr, appName string
+	var streamKey, publishSecret, clientAddr, appName, param string
 	contentType := r.Header.Get("Content-Type")
 
 	// 1. Parse JSON từ SRS Media Server
@@ -2129,6 +2296,7 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				clientAddr = payload.IP
 				appName = payload.App
+				param = payload.Param
 			}
 		}
 	}
@@ -2146,6 +2314,8 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 			if appName == "" {
 				appName = r.FormValue("app")
 			}
+			param = r.FormValue("param")
+			publishSecret = r.FormValue("publish_secret")
 		} else if strings.Contains(err.Error(), "http: request body too large") {
 			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
 			return
@@ -2155,10 +2325,21 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	if clientAddr == "" {
 		clientAddr = getClientIP(r)
 	}
+	if publishSecret == "" {
+		publishSecret = publishSecretFromSRSParam(param)
+	}
 
 	// Kiểm tra tính hợp lệ và đang hoạt động trong MongoDB
-	if streamKey != "" && verifyStreamKey(streamKey) {
-		log.Printf("[AUTH SUCCESS] Stream allowed (MongoDB verified) - Key: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
+	if streamKey != "" && verifyInternalABRStream(appName, streamKey, clientAddr) {
+		log.Printf("[AUTH SUCCESS] Internal ABR rendition allowed - Room rendition: '%s'", streamKey)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"code":0}`)
+		return
+	}
+
+	if streamKey != "" && appName != "abr" && verifyStreamKey(streamKey, publishSecret) {
+		log.Printf("[AUTH SUCCESS] Stream allowed (MongoDB verified) - Room: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
 		recordLiveSession(streamKey, appName, clientAddr)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -2167,7 +2348,7 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[AUTH FAILED] Stream denied - Key: '%s' (Khóa bị chặn hoặc không tồn tại) | Client: %s", streamKey, clientAddr)
+	log.Printf("[AUTH FAILED] Stream denied - Room: '%s' (không hợp lệ hoặc publish secret sai) | Client: %s", streamKey, clientAddr)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid or Disabled Stream Key"}`)
@@ -2210,6 +2391,7 @@ func main() {
 
 	// APIs Quản lý Stream Keys, Sessions & Video Xem Lại (Replays)
 	mux.HandleFunc("/api/keys", apiKeysHandler)
+	mux.HandleFunc("/api/keys/secret", revealPublishSecretHandler)
 	mux.HandleFunc("/api/keys/toggle", toggleKeyHandler)
 	mux.HandleFunc("/api/sessions", apiSessionsHandler)
 	mux.HandleFunc("/api/sessions/replay", apiSessionReplayManageHandler)

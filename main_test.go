@@ -20,22 +20,22 @@ func TestAuthHandler(t *testing.T) {
 		expectedStatus int
 	}{
 		{
-			name:           "Valid Key - test",
+			name:           "Public room name without publish secret is rejected",
 			method:         http.MethodPost,
 			streamKey:      "test",
-			expectedStatus: http.StatusOK,
+			expectedStatus: http.StatusForbidden,
 		},
 		{
-			name:           "Valid Key - tiendev",
+			name:           "Legacy room name without publish secret is rejected",
 			method:         http.MethodPost,
 			streamKey:      "tiendev",
-			expectedStatus: http.StatusOK,
+			expectedStatus: http.StatusForbidden,
 		},
 		{
-			name:           "Valid Key - supersecret",
+			name:           "Static fallback room name is rejected",
 			method:         http.MethodPost,
 			streamKey:      "supersecret",
-			expectedStatus: http.StatusOK,
+			expectedStatus: http.StatusForbidden,
 		},
 		{
 			name:           "Invalid Key",

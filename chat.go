@@ -48,18 +48,19 @@ type WSInboundMessage struct {
 
 // WSOutboundMessage payload server broadcast tới các client
 type WSOutboundMessage struct {
-	Type        string        `json:"type"`                  // "chat" | "system" | "viewer_count" | "reaction" | "history" | "auth_login_result" | "error"
-	Data        *ChatMessage  `json:"data,omitempty"`        // Tin nhắn đơn
-	ViewerCount int           `json:"viewer_count,omitempty"` // Số người đang xem
-	Emoji       string        `json:"emoji,omitempty"`       // Icon thả tim
-	Sender      string        `json:"sender,omitempty"`      // Người gửi reaction
-	History     []ChatMessage `json:"history,omitempty"`     // Lịch sử tin nhắn gần đây
-	Success     bool          `json:"success,omitempty"`     // Cho auth_login_result
-	Error       string        `json:"error,omitempty"`       // Cho auth_login_result hoặc error
-	Token       string        `json:"token,omitempty"`       // Cho auth_login_result
-	User        *User         `json:"user,omitempty"`        // Cho auth_login_result
-	StreamKey   string        `json:"stream_key,omitempty"`  // Cho auth_login_result
-	StreamKeys  []StreamKey   `json:"stream_keys,omitempty"` // Cho auth_login_result
+	Type          string                `json:"type"`                   // "chat" | "system" | "viewer_count" | "reaction" | "history" | "auth_login_result" | "error"
+	Data          *ChatMessage          `json:"data,omitempty"`         // Tin nhắn đơn
+	ViewerCount   int                   `json:"viewer_count,omitempty"` // Số người đang xem
+	Emoji         string                `json:"emoji,omitempty"`        // Icon thả tim
+	Sender        string                `json:"sender,omitempty"`       // Người gửi reaction
+	History       []ChatMessage         `json:"history,omitempty"`      // Lịch sử tin nhắn gần đây
+	Success       bool                  `json:"success,omitempty"`      // Cho auth_login_result
+	Error         string                `json:"error,omitempty"`        // Cho auth_login_result hoặc error
+	Token         string                `json:"token,omitempty"`        // Cho auth_login_result
+	User          *User                 `json:"user,omitempty"`         // Cho auth_login_result
+	StreamKey     string                `json:"stream_key,omitempty"`   // Cho auth_login_result
+	PublishSecret string                `json:"publish_secret,omitempty"`
+	StreamKeys    []StreamKeyCredential `json:"stream_keys,omitempty"` // Cho auth_login_result
 }
 
 // isOriginAllowed kiểm tra xem Origin có nằm trong danh sách ALLOWED_ORIGINS hợp lệ hay không (dùng chung cho cả REST CORS và WebSocket)
@@ -395,17 +396,26 @@ func (c *ChatClient) readPump() {
 				_ = cursor.Close(ctxK)
 			}
 			cancelK()
+			for i := range userKeys {
+				if err := hydratePublishSecret(&userKeys[i]); err != nil {
+					log.Printf("[AUTH WS] Không thể mở khóa phát cho phòng %s: %v", userKeys[i].ID.Hex(), err)
+					userKeys[i].PublishSecret = ""
+				}
+			}
 
 			primaryKey := user.Username
+			primaryPublishSecret := ""
 			if len(userKeys) > 0 {
 				primaryKey = userKeys[0].Key
+				primaryPublishSecret = userKeys[0].PublishSecret
 			}
 
 			resp.Success = true
 			resp.Token = token
 			resp.User = &user
 			resp.StreamKey = primaryKey
-			resp.StreamKeys = userKeys
+			resp.PublishSecret = primaryPublishSecret
+			resp.StreamKeys = streamKeyCredentials(userKeys)
 
 			c.username = user.FullName
 			if c.username == "" {
