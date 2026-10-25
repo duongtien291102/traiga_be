@@ -88,6 +88,9 @@ func getGoogleDriveAccessToken() (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return "", err
 	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return "", fmt.Errorf("OAuth2 response did not contain an access token")
+	}
 	return tokenResp.AccessToken, nil
 }
 
@@ -192,12 +195,42 @@ func uploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 		permReq.Header.Set("Authorization", "Bearer "+accessToken)
 		permReq.Header.Set("Content-Type", "application/json")
 		if permResp, errP := httpClient.Do(permReq); errP == nil {
-			permResp.Body.Close()
+			defer permResp.Body.Close()
+			if permResp.StatusCode < http.StatusOK || permResp.StatusCode >= http.StatusMultipleChoices {
+				body, _ := io.ReadAll(permResp.Body)
+				return "", "", fmt.Errorf("Drive upload completed but sharing permission failed (%d): %s", permResp.StatusCode, string(body))
+			}
+		} else {
+			return "", "", fmt.Errorf("Drive upload completed but sharing permission request failed: %w", errP)
 		}
+	} else {
+		return "", "", err
 	}
 
 	previewURL := fmt.Sprintf("https://drive.google.com/file/d/%s/preview", uploadedFile.ID)
 	return uploadedFile.ID, previewURL, nil
+}
+
+func srsHTTPBaseURL() (string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SRS_HTTP_URL")), "/")
+	if baseURL == "" {
+		return "", fmt.Errorf("SRS_HTTP_URL is not configured")
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return "", fmt.Errorf("SRS_HTTP_URL must be an absolute http(s) URL")
+	}
+	return baseURL, nil
+}
+
+func makeSRSRecordURL(baseURL, replayPath string) string {
+	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(replayPath, "/")
+}
+
+func driveAutoUploadConfigured() bool {
+	return strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_CLIENT_ID")) != "" &&
+		strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_CLIENT_SECRET")) != "" &&
+		strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_REFRESH_TOKEN")) != ""
 }
 
 // canAdminManageStreamOrSession kiểm tra quyền sở hữu StreamKey/Session để chống lỗ hổng IDOR giữa các Admin
@@ -252,6 +285,15 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	srsBaseURL, err := srsHTTPBaseURL()
+	if err != nil {
+		log.Printf("[SRS DVR CONFIG ERROR] Không nhận webhook DVR vì thiếu URL lưu trữ: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "1", "error": "Recording storage is not configured"})
+		return
+	}
+
 	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
 	var payload SRSAuthPayload
 	body, err := io.ReadAll(r.Body)
@@ -260,7 +302,12 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(body) > 0 {
-		_ = json.Unmarshal(body, &payload)
+		if err := json.Unmarshal(body, &payload); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "1", "error": "Invalid DVR webhook payload"})
+			return
+		}
 	}
 
 	streamKey := strings.TrimSpace(payload.Stream)
@@ -273,13 +320,15 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 	if appName == "" {
 		appName = "live"
 	}
+	if streamKey == "" || baseName == "." || baseName == string(filepath.Separator) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "1", "error": "DVR webhook is missing stream or file"})
+		return
+	}
 
 	relativeReplayPath := fmt.Sprintf("/record/%s/%s", appName, baseName)
-	srsBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SRS_HTTP_URL")), "/")
-	if srsBaseURL == "" {
-		srsBaseURL = "http://103.82.26.60:8080"
-	}
-	vpsRecordURL := srsBaseURL + relativeReplayPath
+	vpsRecordURL := makeSRSRecordURL(srsBaseURL, relativeReplayPath)
 
 	log.Printf("🎬 [SRS DVR RECORDED] Phiên live '%s' đã xuất file: %s", streamKey, relativeReplayPath)
 
@@ -291,8 +340,9 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 
 	if ready && coll != nil && streamKey != "" && baseName != "" {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
+			now := time.Now()
 
 			// Tìm tiêu đề của Stream Key
 			roomTitle := fmt.Sprintf("Phiên Live %s", streamKey)
@@ -309,12 +359,20 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Tìm phiên live gần nhất của stream_key này
+			// Chỉ gắn file DVR vào phiên còn live hoặc phiên mới kết thúc; tránh gắn file cũ
+			// vào phiên tiếp theo khi cùng stream key phát lại nhanh.
 			var targetSession LiveSession
 			opts := options.FindOne().SetSort(bson.M{"started_at": -1})
-			errFind := coll.FindOne(ctx, bson.M{"stream_key": streamKey}, opts).Decode(&targetSession)
+			errFind := coll.FindOne(ctx, bson.M{
+				"stream_key": streamKey,
+				"started_at": bson.M{"$gte": now.Add(-24 * time.Hour)},
+				"$or": []bson.M{
+					{"status": "live"},
+					{"status": "ended", "replay_url": bson.M{"$exists": false}},
+					{"status": "ended", "replay_url": ""},
+				},
+			}, opts).Decode(&targetSession)
 
-			now := time.Now()
 			if errFind != nil {
 				// Nếu chưa có session thì tạo mới
 				targetSession = LiveSession{
@@ -329,38 +387,61 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 					ReplayURL:    relativeReplayPath,
 					RecordStatus: "ready",
 				}
-				_, _ = coll.InsertOne(ctx, targetSession)
+				if _, errInsert := coll.InsertOne(ctx, targetSession); errInsert != nil {
+					log.Printf("[SRS DVR SESSION ERROR] Không lưu được session cho file %s: %v", relativeReplayPath, errInsert)
+					return
+				}
 			} else {
 				updateFields := bson.M{
 					"replay_url":    relativeReplayPath,
 					"record_status": "ready",
 				}
+				if targetSession.EndedAt == nil {
+					endedAt := now
+					updateFields["ended_at"] = endedAt
+					updateFields["status"] = "ended"
+					updateFields["duration_seconds"] = max(int64(0), int64(now.Sub(targetSession.StartedAt).Seconds()))
+				}
 				if targetSession.Title == "" {
 					updateFields["title"] = roomTitle
 				}
-				_, _ = coll.UpdateOne(ctx, bson.M{"_id": targetSession.ID}, bson.M{"$set": updateFields})
+				if _, errUpdate := coll.UpdateOne(ctx, bson.M{"_id": targetSession.ID}, bson.M{"$set": updateFields}); errUpdate != nil {
+					log.Printf("[SRS DVR SESSION ERROR] Không cập nhật được session %s: %v", targetSession.ID.Hex(), errUpdate)
+					return
+				}
 			}
 
 			// Nếu đã cấu hình Google Drive OAuth2 -> Tự động đẩy file .mp4 lên Google Drive
-			if os.Getenv("GOOGLE_DRIVE_REFRESH_TOKEN") != "" {
-				driveFileName := fmt.Sprintf("TraiGa_%s_%s.mp4", streamKey, now.Format("20060102_150405"))
+			if driveAutoUploadConfigured() {
+				keyPart := regexp.MustCompile(`[^a-zA-Z0-9_-]+`).ReplaceAllString(streamKey, "_")
+				if keyPart == "" {
+					keyPart = "live"
+				}
+				driveFileName := fmt.Sprintf("TraiGa_%s_%s.mp4", keyPart, targetSession.StartedAt.Format("20060102_150405"))
 				log.Printf("☁️ [GOOGLE DRIVE UPLOAD] Đang tải '%s' lên Google Drive...", driveFileName)
 
 				fileID, previewURL, errUp := uploadStreamToGoogleDrive(driveFileName, vpsRecordURL)
 				if errUp != nil {
 					log.Printf("⚠️ [GOOGLE DRIVE UPLOAD ERROR] Không thể tải '%s' lên Google Drive: %v", driveFileName, errUp)
+					ctxStatus, cancelStatus := context.WithTimeout(context.Background(), 10*time.Second)
+					_, _ = coll.UpdateOne(ctxStatus, bson.M{"_id": targetSession.ID}, bson.M{"$set": bson.M{"record_status": "ready"}})
+					cancelStatus()
 					return
 				}
 
 				ctxUp, cancelUp := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancelUp()
-				_, _ = coll.UpdateOne(ctxUp, bson.M{"_id": targetSession.ID}, bson.M{
+				_, errUpdate := coll.UpdateOne(ctxUp, bson.M{"_id": targetSession.ID}, bson.M{
 					"$set": bson.M{
 						"drive_file_id": fileID,
 						"replay_url":    previewURL,
 						"record_status": "uploaded_drive",
 					},
 				})
+				cancelUp()
+				if errUpdate != nil {
+					log.Printf("[GOOGLE DRIVE METADATA ERROR] File đã upload nhưng không cập nhật được phiên %s: %v", targetSession.ID.Hex(), errUpdate)
+					return
+				}
 				log.Printf("✅ [GOOGLE DRIVE UPLOAD SUCCESS] Đã lưu lên Google Drive: %s", previewURL)
 			}
 		}()
@@ -369,6 +450,95 @@ func dvrHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"code":0}`)
+}
+
+// archiveReplayHandler permanently stores a completed local DVR file in Drive.
+func archiveReplayHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	claims, err := getUserFromAuthHeader(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Vui lòng đăng nhập để lưu trữ video"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ chủ kênh mới có thể lưu trữ video"})
+		return
+	}
+	if !driveAutoUploadConfigured() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chưa cấu hình Google Drive để lưu trữ video lâu dài"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Minute)
+	defer cancel()
+	objID, err := primitive.ObjectIDFromHex(strings.TrimSpace(r.URL.Query().Get("id")))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Mã phiên live không hợp lệ"})
+		return
+	}
+	if sessionsColl == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Cơ sở dữ liệu chưa sẵn sàng"})
+		return
+	}
+	var session LiveSession
+	if err := sessionsColl.FindOne(ctx, bson.M{"_id": objID}).Decode(&session); err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy phiên live"})
+		return
+	}
+	if !canAdminManageStreamOrSession(ctx, claims, session.StreamKey, session.Streamer) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Bạn không có quyền lưu trữ video của kênh này"})
+		return
+	}
+	if session.RecordStatus == "uploaded_drive" && session.DriveFileID != "" {
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Video đã được lưu trữ trên Google Drive", "replay_url": session.ReplayURL})
+		return
+	}
+	if !strings.HasPrefix(session.ReplayURL, "/record/") || strings.Contains(session.ReplayURL, "..") {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy bản ghi DVR trên máy chủ để lưu trữ"})
+		return
+	}
+	if session.RecordStatus != "ready" {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Bản ghi chưa sẵn sàng để lưu trữ"})
+		return
+	}
+
+	baseURL, err := srsHTTPBaseURL()
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chưa cấu hình địa chỉ SRS để truy xuất bản ghi"})
+		return
+	}
+	keyPart := regexp.MustCompile(`[^a-zA-Z0-9_-]+`).ReplaceAllString(session.StreamKey, "_")
+	if keyPart == "" {
+		keyPart = "live"
+	}
+	fileName := fmt.Sprintf("TraiGa_%s_%s.mp4", keyPart, session.StartedAt.Format("20060102_150405"))
+	driveID, previewURL, err := uploadStreamToGoogleDrive(fileName, makeSRSRecordURL(baseURL, session.ReplayURL))
+	if err != nil {
+		log.Printf("[REPLAY ARCHIVE] Lưu trữ phiên %s thất bại: %v", objID.Hex(), err)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể tải video lên Google Drive. Hãy thử lại khi bản ghi còn trên máy chủ."})
+		return
+	}
+	if _, err := sessionsColl.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{"$set": bson.M{"drive_file_id": driveID, "replay_url": previewURL, "record_status": "uploaded_drive"}}); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Video đã tải lên nhưng không thể cập nhật hồ sơ lưu trữ"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Đã lưu trữ video trên Google Drive", "replay_url": previewURL})
 }
 
 // apiReplaysHandler trả về danh sách các phiên live có video xem lại (Public cho toàn bộ người xem trên web)

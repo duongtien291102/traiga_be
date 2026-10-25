@@ -57,6 +57,8 @@ jobs:
       - name: Update container app image
         uses: azure/cli@v2
         with:
+          env:
+            SRS_HTTP_URL: ${{ vars.SRS_HTTP_URL || 'http://103.82.26.60:8080' }}
           inlineScript: |
             set -e
             az extension add --name containerapp --upgrade --only-show-errors
@@ -66,3 +68,12 @@ jobs:
             az containerapp update -n "$AZURE_APP" -g "$AZURE_RG" \
               --image "$IMAGE_REPO:${{ github.sha }}" --only-show-errors \
               --query properties.configuration.ingress.fqdn -o tsv
+            az containerapp update -n "$AZURE_APP" -g "$AZURE_RG" \
+              --set-env-vars "SRS_HTTP_URL=$SRS_HTTP_URL" --only-show-errors -o none
+            az containerapp update -n "$AZURE_APP" -g "$AZURE_RG" \
+              --set-env-vars \
+                "GOOGLE_DRIVE_CLIENT_ID=${{ secrets.GOOGLE_DRIVE_CLIENT_ID }}" \
+                "GOOGLE_DRIVE_CLIENT_SECRET=${{ secrets.GOOGLE_DRIVE_CLIENT_SECRET }}" \
+                "GOOGLE_DRIVE_REFRESH_TOKEN=${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}" \
+                "GOOGLE_DRIVE_FOLDER_ID=${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}" \
+              --only-show-errors -o none

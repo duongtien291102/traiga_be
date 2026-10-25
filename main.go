@@ -15,7 +15,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"regexp"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -23,6 +22,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
+	"regexp"
 )
 
 // User đại diện cho tài khoản người dùng trong MongoDB
@@ -40,17 +40,17 @@ type User struct {
 // StreamKey đại diện cho bảng stream_keys trong MongoDB
 type StreamKey struct {
 	ID        primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Key       string              `bson:"key" json:"key"`                       // Mã Stream Key
-	Title     string              `bson:"title" json:"title"`                   // Tiêu đề phòng live
-	Streamer  string              `bson:"streamer" json:"streamer"`             // Tên hiển thị của streamer
-	UserID    *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"` // ID của user sở hữu
-	IsActive  bool                `bson:"is_active" json:"is_active"`           // Bật/tắt quyền phát
-	MS        string              `bson:"ms,omitempty" json:"ms,omitempty"`     // Mã số chiến kê
-	Chang     string              `bson:"chang,omitempty" json:"chang,omitempty"` // Chạng cân
-	Loi       string              `bson:"loi,omitempty" json:"loi,omitempty"`   // Lối đá
-	CanVay    string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"` // Cán vảy
+	Key       string              `bson:"key" json:"key"`                               // Mã Stream Key
+	Title     string              `bson:"title" json:"title"`                           // Tiêu đề phòng live
+	Streamer  string              `bson:"streamer" json:"streamer"`                     // Tên hiển thị của streamer
+	UserID    *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`   // ID của user sở hữu
+	IsActive  bool                `bson:"is_active" json:"is_active"`                   // Bật/tắt quyền phát
+	MS        string              `bson:"ms,omitempty" json:"ms,omitempty"`             // Mã số chiến kê
+	Chang     string              `bson:"chang,omitempty" json:"chang,omitempty"`       // Chạng cân
+	Loi       string              `bson:"loi,omitempty" json:"loi,omitempty"`           // Lối đá
+	CanVay    string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"`   // Cán vảy
 	DatNuoc   string              `bson:"dat_nuoc,omitempty" json:"dat_nuoc,omitempty"` // Đạt nước
-	Thumb     string              `bson:"thumb,omitempty" json:"thumb,omitempty"` // Ảnh đại diện
+	Thumb     string              `bson:"thumb,omitempty" json:"thumb,omitempty"`       // Ảnh đại diện
 	CreatedAt time.Time           `bson:"created_at" json:"created_at"`
 }
 
@@ -75,7 +75,7 @@ type LiveSession struct {
 type AccessLog struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	Username  string             `bson:"username" json:"username"`
-	Role      string             `bson:"role" json:"role"` // "systemadmin", "admin", "user", "guest"
+	Role      string             `bson:"role" json:"role"`     // "systemadmin", "admin", "user", "guest"
 	Action    string             `bson:"action" json:"action"` // "login", "login_failed", "logout", "register", "create_user", "change_role", "delete_user", "start_stream", "stop_stream"
 	IP        string             `bson:"ip" json:"ip"`
 	Details   string             `bson:"details" json:"details"`
@@ -140,6 +140,62 @@ func generateSecureRandomPassword(length int) string {
 		return fmt.Sprintf("AdminSec@%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// generateStreamKey returns a high-entropy key suitable for RTMP publishing.
+func generateStreamKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// ensureAdminStreamKeys migrates username-based legacy keys and creates a key
+// for admins that do not have one yet.
+func ensureAdminStreamKeys(ctx context.Context, user User) ([]StreamKey, error) {
+	if keysColl == nil {
+		return nil, fmt.Errorf("stream key database is unavailable")
+	}
+	filter := bson.M{"$or": []bson.M{{"user_id": user.ID}, {"streamer": user.FullName}, {"streamer": user.Username}}}
+	cursor, err := keysColl.Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]StreamKey, 0)
+	if err := cursor.All(ctx, &keys); err != nil {
+		_ = cursor.Close(ctx)
+		return nil, err
+	}
+	_ = cursor.Close(ctx)
+
+	for i := range keys {
+		if strings.EqualFold(keys[i].Key, user.Username) {
+			newKey, err := generateStreamKey()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := keysColl.UpdateOne(ctx, bson.M{"_id": keys[i].ID}, bson.M{"$set": bson.M{"key": newKey}}); err != nil {
+				return nil, err
+			}
+			keys[i].Key = newKey
+		}
+	}
+
+	if len(keys) == 0 {
+		newKey, err := generateStreamKey()
+		if err != nil {
+			return nil, err
+		}
+		key := StreamKey{Key: newKey, Title: fmt.Sprintf("Kênh %s", user.FullName), Streamer: user.FullName, UserID: &user.ID, IsActive: true, CreatedAt: time.Now()}
+		result, err := keysColl.InsertOne(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		key.ID = result.InsertedID.(primitive.ObjectID)
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // initJWTSecret kiểm tra và nạp JWT_SECRET bắt buộc từ môi trường
@@ -310,7 +366,6 @@ func seedDefaultData() {
 	}
 
 	// 2. Khởi tạo tài khoản admin01 (role: admin - được cấp quyền live)
-	var adminID primitive.ObjectID
 	var adminUser User
 	errAdmin := usersColl.FindOne(ctx, bson.M{"username": "admin01"}).Decode(&adminUser)
 	if errAdmin != nil {
@@ -333,189 +388,77 @@ func seedDefaultData() {
 			}
 			res, err := usersColl.InsertOne(ctx, admin)
 			if err == nil {
-				adminID = res.InsertedID.(primitive.ObjectID)
-				log.Printf("👑 [ADMIN READY] Khởi tạo tài khoản Admin thành công (ID: %s)", adminID.Hex())
+				log.Printf("👑 [ADMIN READY] Khởi tạo tài khoản Admin thành công (ID: %s)", res.InsertedID.(primitive.ObjectID).Hex())
 			}
 		}
 	} else {
-		adminID = adminUser.ID
 		log.Printf("👑 [ADMIN READY] Tài khoản Admin 'admin01' đã sẵn sàng.")
 	}
 
-	// 3. Tạo sẵn các key mẫu của Admin nếu chưa có
-	count, _ := keysColl.CountDocuments(ctx, bson.M{})
-	if count == 0 {
-		defaultKeys := []interface{}{
-			StreamKey{
-				Key:       "thanhtrung01",
-				Title:     "Trại Gà Thành Trung 01 — Trực Tiếp Giao Lưu Chiến Kê",
-				Streamer:  "Thành Trung 01",
-				UserID:    &adminID,
-				IsActive:  true,
-				MS:        "MS 101",
-				Chang:     "2.95 kg",
-				Loi:       "Lối ôm đấm kiềng hầu, đá mé giáp lưng",
-				CanVay:    "Huyền trâm đóng đúng chậu, chân vuông sừng",
-				DatNuoc:   "Đã dạt 2 nước chuẩn",
-				CreatedAt: time.Now(),
-			},
-			StreamKey{
-				Key:       "thanhtrung02",
-				Title:     "Trại Gà Thành Trung 02 — Trực Tiếp Giao Lưu Chiến Kê",
-				Streamer:  "Thành Trung 02",
-				UserID:    &adminID,
-				IsActive:  true,
-				MS:        "MS 201",
-				Chang:     "3.10 kg",
-				Loi:       "Mé xỏ ngang, đánh giáp lưng dạt sườn",
-				CanVay:    "Án Thiên 1 sát gối, vảy khô ráo",
-				DatNuoc:   "Đã dạt 3 nước cứng",
-				CreatedAt: time.Now(),
-			},
+	// Khởi tạo hai tài khoản chủ trại và dữ liệu danh mục trong MongoDB.
+	ensureSeedAdmin := func(username, fullName, passwordEnv string) (primitive.ObjectID, bool) {
+		var existing User
+		if err := usersColl.FindOne(ctx, bson.M{"username": username}).Decode(&existing); err == nil {
+			return existing.ID, true
 		}
-		_, _ = keysColl.InsertMany(ctx, defaultKeys)
-	} else if !adminID.IsZero() {
-		// Đảm bảo các key hệ thống thuộc về adminID
-		_, _ = keysColl.UpdateMany(ctx,
-			bson.M{"key": bson.M{"$in": []string{"thanhtrung01", "thanhtrung02", "tiendev", "supersecret"}}},
-			bson.M{"$set": bson.M{"user_id": adminID}},
-		)
+		password := strings.TrimSpace(os.Getenv(passwordEnv))
+		if password == "" {
+			password = generateSecureRandomPassword(16)
+			log.Printf("[ADMIN BOOTSTRAP] Tài khoản '%s' tạo mật khẩu ngẫu nhiên. Đặt %s để chỉ định mật khẩu.", username, passwordEnv)
+		}
+		hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("[ADMIN BOOTSTRAP] Không thể mã hóa mật khẩu cho %s: %v", username, err)
+			return primitive.NilObjectID, false
+		}
+		result, err := usersColl.InsertOne(ctx, User{Username: username, Password: string(hashed), FullName: fullName, Role: "admin", CreatedAt: time.Now()})
+		if err != nil {
+			log.Printf("[ADMIN BOOTSTRAP] Không thể tạo tài khoản %s: %v", username, err)
+			return primitive.NilObjectID, false
+		}
+		return result.InsertedID.(primitive.ObjectID), true
 	}
 
-	// 4. Khởi tạo tài khoản admin02 (Chủ Trại Thành Trung 02) và dữ liệu thật
-	var admin02ID primitive.ObjectID
-	var admin02User User
-	errAdmin02 := usersColl.FindOne(ctx, bson.M{"username": "admin02"}).Decode(&admin02User)
-	if errAdmin02 != nil {
-		admin02Pass := strings.TrimSpace(os.Getenv("INITIAL_ADMIN02_PASSWORD"))
-		if admin02Pass == "" {
-			admin02Pass = "admin02@123"
-		}
-		hashed02, err := bcrypt.GenerateFromPassword([]byte(admin02Pass), bcrypt.DefaultCost)
-		if err == nil {
-			admin02 := User{
-				Username:  "admin02",
-				Password:  string(hashed02),
-				FullName:  "Chủ Trại Thành Trung 02",
-				Role:      "admin",
-				CreatedAt: time.Now(),
-			}
-			res02, errIns := usersColl.InsertOne(ctx, admin02)
-			if errIns == nil {
-				admin02ID = res02.InsertedID.(primitive.ObjectID)
-				log.Printf("👑 [ADMIN02 READY] Khởi tạo tài khoản 'admin02' thành công (ID: %s)", admin02ID.Hex())
-			}
-		}
-	} else {
-		admin02ID = admin02User.ID
-		log.Printf("👑 [ADMIN02 READY] Tài khoản 'admin02' đã sẵn sàng.")
+	seedAdmins := []struct {
+		username string
+		name     string
+		key      string
+		ms       string
+		weight   string
+		style    string
+	}{
+		{"admin05", "Chủ Trại Thành Trung 05", "thanhtrung05", "MS 501", "2.95 kg", "Lối ôm đấm kiềng hầu, đá mé giáp lưng"},
+		{"admin06", "Chủ Trại Thành Trung 06", "thanhtrung06", "MS 601", "3.10 kg", "Mé xỏ ngang, đánh giáp lưng dạt sườn"},
 	}
-
-	// Tạo Stream Key thật cho admin02
-	if !admin02ID.IsZero() {
-		count02Key, _ := keysColl.CountDocuments(ctx, bson.M{"key": "thanhtrung02"})
-		if count02Key == 0 {
-			_, _ = keysColl.InsertOne(ctx, StreamKey{
-				Key:       "thanhtrung02",
-				Title:     "Trại Gà Thành Trung 02 — Trực Tiếp Giao Lưu Chiến Kê",
-				Streamer:  "Thành Trung 02",
-				UserID:    &admin02ID,
-				IsActive:  true,
-				MS:        "MS 201",
-				Chang:     "3.10 kg",
-				Loi:       "Mé xỏ ngang, đánh giáp lưng dạt sườn",
-				CanVay:    "Án Thiên 1 sát gối, vảy khô ráo",
-				DatNuoc:   "Đã dạt 3 nước cứng",
-				CreatedAt: time.Now(),
-			})
-			log.Printf("📡 [STREAM KEY READY] Đã tạo Stream Key 'thanhtrung02' cho tài khoản admin02")
+	for _, seed := range seedAdmins {
+		adminID, ok := ensureSeedAdmin(seed.username, seed.name, "INITIAL_"+strings.ToUpper(seed.username)+"_PASSWORD")
+		if !ok {
+			continue
 		}
+		_, _ = keysColl.UpdateOne(ctx, bson.M{"key": seed.key}, bson.M{"$setOnInsert": StreamKey{
+			Key: seed.key, Title: seed.name + " — Trực Tiếp Giao Lưu Chiến Kê", Streamer: seed.name,
+			UserID: &adminID, IsActive: true, MS: seed.ms, Chang: seed.weight, Loi: seed.style, CreatedAt: time.Now(),
+		}}, options.Update().SetUpsert(true))
 
-		// Tạo các chiến kê thật trong MongoDB cho admin02
-		if chickensColl != nil {
-			count02Chickens, _ := chickensColl.CountDocuments(ctx, bson.M{"created_by": "admin02"})
-			if count02Chickens == 0 {
-				now := time.Now()
-				sampleChickens := []interface{}{
-					Chicken{
-						ID:         primitive.NewObjectID(),
-						MS:         "MS 201",
-						Title:      "Ô Chân Trắng Điểm Mực 2.95kg Bo Đá Cực Chắc, Ôm Đấm Đòn Lưng",
-						Breed:      "don",
-						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
-						Chang:      "2.95 kg",
-						Age:        "11 tháng tơ",
-						CanVay:     "Huyền trâm đóng đúng chậu, chân vuông sừng",
-						Loi:        "Lối ôm đấm kiềng hầu, đá mé giáp lưng",
-						DatNuoc:    "Đã dạt 2 nước chuẩn",
-						Price:      3500000,
-						PriceText:  "3.500.000 đ",
-						Farm:       "Trại Gà Thành Trung 01",
-						SellerName: "Thành Trung 01",
-						Phone:      "0988.888.201",
-						Zalo:       "0988.888.201",
-						Location:   "Long Biên, Hà Nội",
-						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
-						Status:     "available",
-						UserID:     &admin02ID,
-						CreatedBy:  "admin02",
-						CreatedAt:  now.Add(-2 * time.Hour),
-						UpdatedAt:  now,
-					},
-					Chicken{
-						ID:         primitive.NewObjectID(),
-						MS:         "MS 202",
-						Title:      "Tía Chân Xanh Án Thiên 1 Đòn Mé Xỏ Ngang Giáp Lưng Dạt Sườn",
-						Breed:      "don",
-						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
-						Chang:      "3.10 kg",
-						Age:        "12 tháng",
-						CanVay:     "Án Thiên 1 sát gối, vảy khô ráo",
-						Loi:        "Mé xỏ ngang, đánh giáp lưng dạt sườn",
-						DatNuoc:    "Đã dạt 3 nước cứng",
-						Price:      4200000,
-						PriceText:  "4.200.000 đ",
-						Farm:       "Trại Gà Thành Trung 02",
-						SellerName: "Thành Trung 02",
-						Phone:      "0988.888.201",
-						Zalo:       "0988.888.201",
-						Location:   "Long Biên, Hà Nội",
-						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
-						Status:     "available",
-						UserID:     &admin02ID,
-						CreatedBy:  "admin02",
-						CreatedAt:  now.Add(-1 * time.Hour),
-						UpdatedAt:  now,
-					},
-					Chicken{
-						ID:         primitive.NewObjectID(),
-						MS:         "MS 203",
-						Title:      "Xám Chuối 2.85kg Lối Đá Mé Nhanh Gọn Bo Lớn",
-						Breed:      "don",
-						BreedName:  "Gà Đòn Long Biên Tuyển Chọn",
-						Chang:      "2.85 kg",
-						Age:        "10 tháng",
-						CanVay:     "Tam tài án thiên, chân khô đòn bén",
-						Loi:        "Đá mé kiềng đấm hầu",
-						DatNuoc:    "Đã dạt 2 nước tơ",
-						Price:      2900000,
-						PriceText:  "2.900.000 đ",
-						Farm:       "Trại Gà Thành Trung 03",
-						SellerName: "Thành Trung 03",
-						Phone:      "0988.888.201",
-						Zalo:       "0988.888.201",
-						Location:   "Long Biên, Hà Nội",
-						Image:      "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
-						Status:     "available",
-						UserID:     &admin02ID,
-						CreatedBy:  "admin02",
-						CreatedAt:  now,
-						UpdatedAt:  now,
-					},
-				}
-				_, _ = chickensColl.InsertMany(ctx, sampleChickens)
-				log.Printf("🐔 [CHICKENS READY] Đã tạo 3 chiến kê thật trong MongoDB cho tài khoản admin02")
-			}
+		if chickensColl == nil {
+			continue
+		}
+		count, _ := chickensColl.CountDocuments(ctx, bson.M{"created_by": seed.username})
+		if count > 0 {
+			continue
+		}
+		chicken := Chicken{
+			ID: primitive.NewObjectID(), MS: seed.ms,
+			Title: seed.name + " — Chiến kê giao lưu " + seed.weight,
+			Breed: "don", BreedName: "Gà Đòn Long Biên Tuyển Chọn", Chang: seed.weight,
+			Age: "11 tháng tơ", CanVay: "Huyền trâm đóng đúng chậu, chân vuông sừng", Loi: seed.style,
+			DatNuoc: "Đã dạt 2 nước chuẩn", Price: 3500000, PriceText: "3.500.000 đ",
+			Farm: seed.name, SellerName: seed.name, Location: "Long Biên, Hà Nội",
+			Image:  "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
+			Status: "available", UserID: &adminID, CreatedBy: seed.username, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}
+		if _, err := chickensColl.InsertOne(ctx, chicken); err != nil {
+			log.Printf("[CHICKEN SEED] Không thể tạo dữ liệu cho %s: %v", seed.username, err)
 		}
 	}
 }
@@ -1014,42 +957,15 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	streamKeyStr := ""
 	var userKeys []StreamKey
 	if user.Role == "admin" {
-		filter := bson.M{
-			"$and": []bson.M{
-				{"is_active": true},
-				{
-					"$or": []bson.M{
-						{"user_id": user.ID},
-						{"streamer": user.FullName},
-						{"streamer": user.Username},
-					},
-				},
-			},
+		userKeys, err = ensureAdminStreamKeys(ctx, user)
+		if err != nil {
+			http.Error(w, `{"error":"Không thể tải Stream Key"}`, http.StatusInternalServerError)
+			return
 		}
-		cursor, errK := keysColl.Find(ctx, filter)
-		if errK == nil && cursor != nil {
-			_ = cursor.All(ctx, &userKeys)
-			_ = cursor.Close(ctx)
-		}
-		if len(userKeys) > 0 {
-			streamKeyStr = userKeys[0].Key
-		} else {
-			// Tự động cấp Stream Key ban đầu theo username của Admin nếu chưa có
-			newAdminKey := StreamKey{
-				Key:       user.Username,
-				Title:     fmt.Sprintf("Kênh %s", user.FullName),
-				Streamer:  user.FullName,
-				UserID:    &user.ID,
-				IsActive:  true,
-				CreatedAt: time.Now(),
-			}
-			resK, errIns := keysColl.InsertOne(ctx, newAdminKey)
-			if errIns == nil && resK != nil {
-				newAdminKey.ID = resK.InsertedID.(primitive.ObjectID)
-				userKeys = append(userKeys, newAdminKey)
-				streamKeyStr = newAdminKey.Key
-			} else {
-				streamKeyStr = user.Username
+		for _, key := range userKeys {
+			if key.IsActive {
+				streamKeyStr = key.Key
+				break
 			}
 		}
 	}
@@ -1118,27 +1034,17 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	streamKeyStr := ""
 	var userKeys []StreamKey
 	if user.Role == "admin" {
-		filter := bson.M{
-			"$and": []bson.M{
-				{"is_active": true},
-				{
-					"$or": []bson.M{
-						{"user_id": objID},
-						{"streamer": user.FullName},
-						{"streamer": user.Username},
-					},
-				},
-			},
+		user.ID = objID
+		userKeys, err = ensureAdminStreamKeys(ctx, user)
+		if err != nil {
+			http.Error(w, `{"error":"Không thể tải Stream Key"}`, http.StatusInternalServerError)
+			return
 		}
-		cursor, errK := keysColl.Find(ctx, filter)
-		if errK == nil && cursor != nil {
-			_ = cursor.All(ctx, &userKeys)
-			_ = cursor.Close(ctx)
-		}
-		if len(userKeys) > 0 {
-			streamKeyStr = userKeys[0].Key
-		} else {
-			streamKeyStr = user.Username
+		for _, key := range userKeys {
+			if key.IsActive {
+				streamKeyStr = key.Key
+				break
+			}
 		}
 	}
 
@@ -1816,7 +1722,7 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 			Username  string `json:"username"`
 			Password  string `json:"password"`
 			FullName  string `json:"full_name"`
-			Role      string `json:"role"` // "admin" hoặc "user"
+			Role      string `json:"role"`       // "admin" hoặc "user"
 			StreamKey string `json:"stream_key"` // Mã khóa luồng tùy chọn
 		}
 
@@ -1879,7 +1785,11 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 		if req.Role == "admin" {
 			keyVal := req.StreamKey
 			if keyVal == "" {
-				keyVal = req.Username
+				keyVal, err = generateStreamKey()
+				if err != nil {
+					http.Error(w, `{"error":"Không thể tạo Stream Key an toàn"}`, http.StatusInternalServerError)
+					return
+				}
 			}
 			var existKey StreamKey
 			if err := keysColl.FindOne(ctx, bson.M{"key": keyVal}).Decode(&existKey); err == nil {
@@ -1953,8 +1863,13 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 		if req.Role == "admin" {
 			count, _ := keysColl.CountDocuments(ctx, bson.M{"user_id": targetUser.ID})
 			if count == 0 {
+				newKeyValue, err := generateStreamKey()
+				if err != nil {
+					http.Error(w, `{"error":"Không thể tạo Stream Key an toàn"}`, http.StatusInternalServerError)
+					return
+				}
 				newKey := StreamKey{
-					Key:       targetUser.Username,
+					Key:       newKeyValue,
 					Title:     fmt.Sprintf("Kênh %s", targetUser.FullName),
 					Streamer:  targetUser.FullName,
 					UserID:    &targetUser.ID,
@@ -2298,6 +2213,7 @@ func main() {
 	mux.HandleFunc("/api/keys/toggle", toggleKeyHandler)
 	mux.HandleFunc("/api/sessions", apiSessionsHandler)
 	mux.HandleFunc("/api/sessions/replay", apiSessionReplayManageHandler)
+	mux.HandleFunc("/api/sessions/archive", archiveReplayHandler)
 	mux.HandleFunc("/api/replays", apiReplaysHandler)
 	mux.HandleFunc("/api/users", apiUsersHandler)
 	mux.HandleFunc("/health", healthHandler)
