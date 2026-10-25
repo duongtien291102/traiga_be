@@ -57,8 +57,6 @@ jobs:
       - name: Update container app image
         uses: azure/cli@v2
         with:
-          env:
-            SRS_HTTP_URL: ${{ vars.SRS_HTTP_URL || 'http://103.82.26.60:8080' }}
           inlineScript: |
             set -e
             az extension add --name containerapp --upgrade --only-show-errors
@@ -77,3 +75,5 @@ jobs:
                 "GOOGLE_DRIVE_REFRESH_TOKEN=${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}" \
                 "GOOGLE_DRIVE_FOLDER_ID=${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}" \
               --only-show-errors -o none
+        env:
+          SRS_HTTP_URL: ${{ vars.SRS_HTTP_URL || 'http://103.82.26.60:8080' }}
