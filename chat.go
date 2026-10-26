@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -158,6 +159,8 @@ type ChatClient struct {
 	username      string
 	avatar        string
 	role          string
+	userID        string
+	roomOwner     bool
 	clientIP      string
 	authenticated bool
 	rateLimiter   *TokenBucket
@@ -184,8 +187,9 @@ type ChatHub struct {
 }
 
 type broadcastEvent struct {
-	streamKey string
-	message   []byte
+	streamKey    string
+	message      []byte
+	ownerMessage []byte
 }
 
 var globalChatHub = &ChatHub{
@@ -238,8 +242,12 @@ func (h *ChatHub) run() {
 			h.mutex.RLock()
 			if clients, ok := h.rooms[event.streamKey]; ok {
 				for client := range clients {
+					message := event.message
+					if client.roomOwner && len(event.ownerMessage) > 0 {
+						message = event.ownerMessage
+					}
 					select {
-					case client.send <- event.message:
+					case client.send <- message:
 					default:
 						// Buffer đầy -> đóng kết nối
 						close(client.send)
@@ -423,6 +431,8 @@ func (c *ChatClient) readPump() {
 			}
 			c.avatar = user.Avatar
 			c.role = user.Role
+			c.userID = user.ID.Hex()
+			c.roomOwner = isRoomOwnerUserID(c.streamKey, c.userID)
 			c.authenticated = true
 
 			recordAccessLog(user.Username, user.Role, "login", c.getIP(), "Đăng nhập thành công từ Mobile Studio")
@@ -491,6 +501,8 @@ func (c *ChatClient) readPump() {
 			c.username = displayName
 			c.avatar = userAvatar
 			c.role = claims.Role
+			c.userID = claims.UserID
+			c.roomOwner = isRoomOwnerUserID(c.streamKey, c.userID)
 			c.authenticated = true
 
 			ack := WSOutboundMessage{
@@ -576,7 +588,13 @@ func (c *ChatClient) readPump() {
 				Data: &chatMsg,
 			}
 			if b, err := json.Marshal(out); err == nil {
-				c.hub.broadcast <- broadcastEvent{streamKey: c.streamKey, message: b}
+				maskedMsg := chatMsg
+				maskedMsg.Message = maskPhoneNumbers(maskedMsg.Message)
+				maskedOut := WSOutboundMessage{Type: "chat", Data: &maskedMsg}
+				maskedBytes, marshalErr := json.Marshal(maskedOut)
+				if marshalErr == nil {
+					c.hub.broadcast <- broadcastEvent{streamKey: c.streamKey, message: maskedBytes, ownerMessage: b}
+				}
 			}
 		}
 	}
@@ -585,6 +603,9 @@ func (c *ChatClient) readPump() {
 // sendChatHistory gửi danh sách tin nhắn gần đây cho socket sau khi xác thực
 func (c *ChatClient) sendChatHistory() {
 	history := getRecentChatHistory(c.streamKey)
+	if !c.roomOwner {
+		history = sanitizeChatHistory(history, false)
+	}
 	historyMsg := WSOutboundMessage{
 		Type:    "history",
 		History: history,
@@ -625,6 +646,97 @@ func (c *ChatClient) fallbackToGuest(sender string, reason string) {
 	}
 
 	c.sendChatHistory()
+}
+
+var phoneNumberPattern = regexp.MustCompile(`(\+?84|0)[0-9][0-9 ().-]{6,18}`)
+
+// maskPhoneNumbers che bốn chữ số cuối của số điện thoại Việt Nam trong chat.
+func maskPhoneNumbers(message string) string {
+	return phoneNumberPattern.ReplaceAllStringFunc(message, func(candidate string) string {
+		trimmed := strings.TrimRight(candidate, " .-)")
+		digits := make([]int, 0, len(trimmed))
+		for i, r := range trimmed {
+			if r >= '0' && r <= '9' {
+				digits = append(digits, i)
+			}
+		}
+		prefix := strings.TrimSpace(trimmed)
+		validLength := len(digits) >= 9 && len(digits) <= 11
+		if strings.HasPrefix(prefix, "+84") || strings.HasPrefix(prefix, "84") {
+			validLength = len(digits) >= 11 && len(digits) <= 12
+		}
+		if !validLength {
+			return candidate
+		}
+		masked := []rune(candidate)
+		for _, pos := range digits[len(digits)-4:] {
+			masked[pos] = '*'
+		}
+		return string(masked)
+	})
+}
+
+func sanitizeChatHistory(messages []ChatMessage, canViewPhones bool) []ChatMessage {
+	if canViewPhones {
+		return messages
+	}
+	for i := range messages {
+		messages[i].Message = maskPhoneNumbers(messages[i].Message)
+	}
+	return messages
+}
+
+// isRoomOwnerUserID checks room ownership from persisted server-side records;
+// the client-supplied role or stream key alone never grants access.
+func isRoomOwnerUserID(streamKey, userID string) bool {
+	if keysColl == nil || usersColl == nil || strings.TrimSpace(userID) == "" {
+		return false
+	}
+	userObjectID, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var room StreamKey
+	if err := keysColl.FindOne(ctx, bson.M{"key": streamKey}).Decode(&room); err != nil {
+		return false
+	}
+	if room.UserID != nil {
+		return *room.UserID == userObjectID
+	}
+	if strings.TrimSpace(room.Streamer) == "" {
+		return false
+	}
+	var owner User
+	ownerName := strings.TrimSpace(room.Streamer)
+	err = usersColl.FindOne(ctx, bson.M{"$or": []bson.M{
+		{"username": strings.ToLower(ownerName)},
+		{"full_name": ownerName},
+	}}).Decode(&owner)
+	return err == nil && owner.ID == userObjectID
+}
+
+func requestCanViewRoomPhones(r *http.Request, streamKey string) bool {
+	if globalTokenRevocationStore == nil {
+		return false
+	}
+	tokenString := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if tokenString == "" || len(tokenString) > 4096 || globalTokenRevocationStore.IsTokenRevoked(tokenString) {
+		return false
+	}
+	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return false
+	}
+	claims, ok := token.Claims.(*JWTClaims)
+	return ok && isRoomOwnerUserID(streamKey, claims.UserID)
 }
 
 // sendAuthErrorAndClose gửi thông báo lỗi xác thực và đóng socket an toàn
@@ -829,6 +941,7 @@ func apiChatHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	canViewPhones := requestCanViewRoomPhones(r, streamKey)
 	if sessionID != "" && chatColl != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -847,11 +960,13 @@ func apiChatHistoryHandler(w http.ResponseWriter, r *http.Request) {
 					msgs[i].Username = "Chủ Trại"
 				}
 			}
+			msgs = sanitizeChatHistory(msgs, canViewPhones)
 			json.NewEncoder(w).Encode(msgs)
 			return
 		}
 	}
 
 	history := getRecentChatHistory(streamKey)
+	history = sanitizeChatHistory(history, canViewPhones)
 	json.NewEncoder(w).Encode(history)
 }

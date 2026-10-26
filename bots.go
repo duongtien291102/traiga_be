@@ -138,8 +138,13 @@ func (m *BotRunnerManager) StartBots(streamKey string, bots []ChatBot) {
 						Type: "chat",
 						Data: &chatMsg,
 					}
-					if b, err := json.Marshal(out); err == nil {
-						globalChatHub.broadcast <- broadcastEvent{streamKey: key, message: b}
+					if ownerBytes, err := json.Marshal(out); err == nil {
+						maskedMsg := chatMsg
+						maskedMsg.Message = maskPhoneNumbers(maskedMsg.Message)
+						maskedOut := WSOutboundMessage{Type: "chat", Data: &maskedMsg}
+						if publicBytes, marshalErr := json.Marshal(maskedOut); marshalErr == nil {
+							globalChatHub.broadcast <- broadcastEvent{streamKey: key, message: publicBytes, ownerMessage: ownerBytes}
+						}
 					}
 
 					log.Printf("🤖 [BOT CHAT] [%s] %s: %s", key, bot.Name, text)
@@ -571,11 +576,11 @@ func adminRoomBotsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":     true,
-			"stream_key":  streamKey,
-			"bot_count":   len(botObjIDs),
-			"is_running":  globalBotManager.IsRunning(streamKey),
-			"message":     fmt.Sprintf("Đã cập nhật cấu hình (%d/5 bot, đang %s)", len(botObjIDs), map[bool]string{true: "chạy", false: "dừng"}[req.IsRunning]),
+			"success":    true,
+			"stream_key": streamKey,
+			"bot_count":  len(botObjIDs),
+			"is_running": globalBotManager.IsRunning(streamKey),
+			"message":    fmt.Sprintf("Đã cập nhật cấu hình (%d/5 bot, đang %s)", len(botObjIDs), map[bool]string{true: "chạy", false: "dừng"}[req.IsRunning]),
 		})
 
 	default:
