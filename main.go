@@ -24,8 +24,20 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"regexp"
 
+	"livestream-be/internal/model"
 	"livestream-be/internal/security/limiter"
 	"livestream-be/internal/security/token"
+)
+
+// Type aliases for gradual refactoring (Phase 2)
+type (
+	User                = model.User
+	StreamKey           = model.StreamKey
+	StreamKeyCredential = model.StreamKeyCredential
+	LiveSession         = model.LiveSession
+	AccessLog           = model.AccessLog
+	SRSAuthPayload      = model.SRSAuthPayload
+	JWTClaims           = model.JWTClaims
 )
 
 // Backwards-compatibility layer for root package files during gradual refactoring (Phases 1-4)
@@ -51,100 +63,12 @@ var (
 	RateLimitLoginMiddleware = limiter.RateLimitLoginMiddleware
 )
 
-// User đại diện cho tài khoản người dùng trong MongoDB
-type User struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Username  string             `bson:"username" json:"username"`
-	Password  string             `bson:"password" json:"-"`
-	FullName  string             `bson:"full_name" json:"full_name"`
-	Avatar    string             `bson:"avatar,omitempty" json:"avatar,omitempty"`
-	Phone     string             `bson:"phone,omitempty" json:"phone,omitempty"`
-	Role      string             `bson:"role" json:"role"` // "systemadmin", "admin" hoặc "user"
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
-}
-
-// StreamKey đại diện cho bảng stream_keys trong MongoDB
-type StreamKey struct {
-	ID                     primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Key                    string              `bson:"key" json:"key"` // Public room identifier, not an ingest credential.
-	PublishSecret          string              `bson:"-" json:"-"`
-	PublishSecretEncrypted string              `bson:"publish_secret_enc,omitempty" json:"-"`
-	PublishSecretHash      string              `bson:"publish_secret_hash,omitempty" json:"-"`
-	Title                  string              `bson:"title" json:"title"`
-	Streamer               string              `bson:"streamer" json:"streamer"`
-	UserID                 *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`
-	IsActive               bool                `bson:"is_active" json:"is_active"`
-	MS                     string              `bson:"ms,omitempty" json:"ms,omitempty"`
-	Chang                  string              `bson:"chang,omitempty" json:"chang,omitempty"`
-	Loi                    string              `bson:"loi,omitempty" json:"loi,omitempty"`
-	CanVay                 string              `bson:"can_vay,omitempty" json:"can_vay,omitempty"`
-	DatNuoc                string              `bson:"dat_nuoc,omitempty" json:"dat_nuoc,omitempty"`
-	Thumb                  string              `bson:"thumb,omitempty" json:"thumb,omitempty"`
-	CreatedAt              time.Time           `bson:"created_at" json:"created_at"`
-}
-
-type StreamKeyCredential struct {
-	StreamKey
-	PublishSecret string `json:"publish_secret"`
-}
-
 func streamKeyCredentials(keys []StreamKey) []StreamKeyCredential {
 	credentials := make([]StreamKeyCredential, 0, len(keys))
 	for _, key := range keys {
 		credentials = append(credentials, StreamKeyCredential{StreamKey: key, PublishSecret: key.PublishSecret})
 	}
 	return credentials
-}
-
-// LiveSession lưu trữ phiên live và đường dẫn video xem lại (Google Drive / SRS DVR)
-type LiveSession struct {
-	ID              primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	StreamKey       string             `bson:"stream_key" json:"stream_key"`
-	Streamer        string             `bson:"streamer" json:"streamer"`
-	Title           string             `bson:"title,omitempty" json:"title,omitempty"`
-	App             string             `bson:"app" json:"app"`
-	ClientIP        string             `bson:"client_ip" json:"client_ip"`
-	Status          string             `bson:"status" json:"status"` // "live", "ended"
-	StartedAt       time.Time          `bson:"started_at" json:"started_at"`
-	EndedAt         *time.Time         `bson:"ended_at,omitempty" json:"ended_at,omitempty"`
-	DurationSeconds int64              `bson:"duration_seconds" json:"duration_seconds"`
-	ReplayURL       string             `bson:"replay_url,omitempty" json:"replay_url,omitempty"`
-	DriveFileID     string             `bson:"drive_file_id,omitempty" json:"drive_file_id,omitempty"`
-	RecordStatus    string             `bson:"record_status,omitempty" json:"record_status,omitempty"`
-}
-
-// AccessLog lưu vết lịch sử vào/ra, phiên live và các hoạt động quản trị
-type AccessLog struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Username  string             `bson:"username" json:"username"`
-	Role      string             `bson:"role" json:"role"`     // "systemadmin", "admin", "user", "guest"
-	Action    string             `bson:"action" json:"action"` // "login", "login_failed", "logout", "register", "create_user", "change_role", "delete_user", "start_stream", "stop_stream"
-	IP        string             `bson:"ip" json:"ip"`
-	Details   string             `bson:"details" json:"details"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
-}
-
-// SRSAuthPayload webhook payload từ SRS
-type SRSAuthPayload struct {
-	ServerID string `json:"server_id"`
-	Action   string `json:"action"`
-	ClientID any    `json:"client_id"`
-	IP       string `json:"ip"`
-	VHost    string `json:"vhost"`
-	App      string `json:"app"`
-	Stream   string `json:"stream"`
-	Name     string `json:"name"`
-	Param    string `json:"param"`
-	Cwd      string `json:"cwd"`
-	File     string `json:"file"`
-}
-
-// JWT Claims
-type JWTClaims struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
-	jwt.RegisteredClaims
 }
 
 var (
