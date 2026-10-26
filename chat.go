@@ -19,6 +19,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
+
+	"livestream-be/internal/security/limiter"
 )
 
 // ChatMessage đại diện cho 1 tin nhắn trong phòng live
@@ -331,8 +333,8 @@ func (c *ChatClient) readPump() {
 			resp.Type = "auth_login_result"
 
 			// Áp dụng Rate Limit chống dò mật khẩu qua WebSocket
-			initRateLimiters()
-			if loginLimiter != nil && !loginLimiter.Allow(c.getIP()) {
+			limiter.InitRateLimiters()
+			if limiter.LoginLimiter != nil && !limiter.LoginLimiter.Allow(c.getIP()) {
 				resp.Error = "Quá nhiều lần thử đăng nhập từ địa chỉ này. Vui lòng thử lại sau 1 phút."
 				if b, err := json.Marshal(resp); err == nil {
 					c.send <- b

@@ -1,4 +1,4 @@
-package main
+package token
 
 import (
 	"crypto/sha256"
@@ -18,6 +18,11 @@ type TokenRevocationStore struct {
 var globalTokenRevocationStore = &TokenRevocationStore{
 	revokedHashes:    make(map[string]time.Time),
 	activeUserTokens: make(map[string]string),
+}
+
+// Global trả về singleton TokenRevocationStore
+func Global() *TokenRevocationStore {
+	return globalTokenRevocationStore
 }
 
 func init() {

@@ -140,4 +140,3 @@ func TestChatResetBroadcastAndOfflineHistory(t *testing.T) {
 
 	t.Log("✅ Sự kiện reset_chat được phát thành công và lịch sử offline bị ẩn hoàn toàn!")
 }
-

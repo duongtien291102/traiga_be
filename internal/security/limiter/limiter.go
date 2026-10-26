@@ -1,4 +1,4 @@
-package main
+package limiter
 
 import (
 	"encoding/json"
@@ -103,9 +103,9 @@ func (l *IPRateLimiter) cleanup() {
 	}
 }
 
-// getClientIP trích xuất địa chỉ IP thực tế của client một cách an toàn.
+// GetClientIP trích xuất địa chỉ IP thực tế của client một cách an toàn.
 // Tuyệt đối không tin cậy X-Forwarded-For trừ khi biến TRUST_PROXY=true được cấu hình từ proxy nội bộ đáng tin cậy.
-func getClientIP(r *http.Request) string {
+func GetClientIP(r *http.Request) string {
 	if os.Getenv("TRUST_PROXY") == "true" {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
@@ -128,8 +128,8 @@ func getClientIP(r *http.Request) string {
 
 // Global rate limiters
 var (
-	loginLimiter    *IPRateLimiter
-	registerLimiter *IPRateLimiter
+	LoginLimiter    *IPRateLimiter
+	RegisterLimiter *IPRateLimiter
 	limiterOnce     sync.Once
 )
 
@@ -139,8 +139,8 @@ const DefaultMaxBodyBytes int64 = 1 << 20 // 1 MB
 // SmallJSONMaxBodyBytes giới hạn kích thước body cho các API JSON/Auth thông thường (64 KB)
 const SmallJSONMaxBodyBytes int64 = 64 * 1024 // 64 KB
 
-// limitRequestBody bọc r.Body bằng http.MaxBytesReader để chống tấn công gửi payload khổng lồ
-func limitRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
+// LimitRequestBody bọc r.Body bằng http.MaxBytesReader để chống tấn công gửi payload khổng lồ
+func LimitRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
 	if r != nil && r.Body != nil {
 		if maxBytes <= 0 {
 			maxBytes = DefaultMaxBodyBytes
@@ -149,8 +149,8 @@ func limitRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
 	}
 }
 
-// initRateLimiters khởi tạo các limiter từ biến môi trường
-func initRateLimiters() {
+// InitRateLimiters khởi tạo các limiter từ biến môi trường
+func InitRateLimiters() {
 	limiterOnce.Do(func() {
 		// Mặc định cho login: 5 lần thử / phút (rate = 5/60 req/s, capacity = 5)
 		maxAttempts := 5.0
@@ -168,7 +168,7 @@ func initRateLimiters() {
 		}
 
 		rate := maxAttempts / windowSeconds
-		loginLimiter = NewIPRateLimiter(rate, maxAttempts, 5*time.Minute)
+		LoginLimiter = NewIPRateLimiter(rate, maxAttempts, 5*time.Minute)
 
 		// Mặc định cho register: 5 lần đăng ký / phút / IP
 		regMax := 5.0
@@ -178,16 +178,16 @@ func initRateLimiters() {
 			}
 		}
 		regRate := regMax / windowSeconds
-		registerLimiter = NewIPRateLimiter(regRate, regMax, 5*time.Minute)
+		RegisterLimiter = NewIPRateLimiter(regRate, regMax, 5*time.Minute)
 	})
 }
 
 // RateLimitLoginMiddleware bọc handler đăng nhập và chặn brute force attack
 func RateLimitLoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	initRateLimiters()
+	InitRateLimiters()
 	return func(w http.ResponseWriter, r *http.Request) {
-		clientIP := getClientIP(r)
-		if !loginLimiter.Allow(clientIP) {
+		clientIP := GetClientIP(r)
+		if !LoginLimiter.Allow(clientIP) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
 			w.WriteHeader(http.StatusTooManyRequests)

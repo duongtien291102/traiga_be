@@ -23,6 +23,32 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 	"regexp"
+
+	"livestream-be/internal/security/limiter"
+	"livestream-be/internal/security/token"
+)
+
+// Backwards-compatibility layer for root package files during gradual refactoring (Phases 1-4)
+var globalTokenRevocationStore = token.Global()
+
+const (
+	SmallJSONMaxBodyBytes = limiter.SmallJSONMaxBodyBytes
+	DefaultMaxBodyBytes   = limiter.DefaultMaxBodyBytes
+)
+
+func getClientIP(r *http.Request) string {
+	return limiter.GetClientIP(r)
+}
+
+func limitRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
+	limiter.LimitRequestBody(w, r, maxBytes)
+}
+
+type TokenBucket = limiter.TokenBucket
+
+var (
+	NewTokenBucket           = limiter.NewTokenBucket
+	RateLimitLoginMiddleware = limiter.RateLimitLoginMiddleware
 )
 
 // User đại diện cho tài khoản người dùng trong MongoDB
@@ -555,7 +581,7 @@ func getUserFromAuthHeader(r *http.Request) (*JWTClaims, error) {
 	}
 
 	tokenStr := parts[1]
-	if globalTokenRevocationStore.IsTokenRevoked(tokenStr) {
+	if token.Global().IsTokenRevoked(tokenStr) {
 		return nil, fmt.Errorf("token has been revoked")
 	}
 
@@ -888,9 +914,9 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	initRateLimiters()
-	clientIP := getClientIP(r)
-	if registerLimiter != nil && !registerLimiter.Allow(clientIP) {
+	limiter.InitRateLimiters()
+	clientIP := limiter.GetClientIP(r)
+	if limiter.RegisterLimiter != nil && !limiter.RegisterLimiter.Allow(clientIP) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -900,7 +926,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
+	limiter.LimitRequestBody(w, r, limiter.SmallJSONMaxBodyBytes)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -980,13 +1006,13 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	recordAccessLog(newUser.Username, newUser.Role, "register", clientIP, "Đăng ký tài khoản mới")
 
 	// Tài khoản thông thường (role: user) KHÔNG được cấp Stream Key để livestream
-	token, _ := createToken(newUser)
-	globalTokenRevocationStore.SetActiveUserToken(newUser.Username, token, time.Now().Add(7*24*time.Hour))
+	jwtToken, _ := createToken(newUser)
+	token.Global().SetActiveUserToken(newUser.Username, jwtToken, time.Now().Add(7*24*time.Hour))
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":    "Đăng ký tài khoản thành công!",
-		"token":      token,
+		"token":      jwtToken,
 		"user":       newUser,
 		"stream_key": "", // Chỉ admin mới có stream_key để livestream
 	})
@@ -999,9 +1025,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	initRateLimiters()
-	clientIP := getClientIP(r)
-	if loginLimiter != nil && !loginLimiter.Allow(clientIP) {
+	limiter.InitRateLimiters()
+	clientIP := limiter.GetClientIP(r)
+	if limiter.LoginLimiter != nil && !limiter.LoginLimiter.Allow(clientIP) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -1011,7 +1037,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
+	limiter.LimitRequestBody(w, r, limiter.SmallJSONMaxBodyBytes)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -1048,14 +1074,14 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := createToken(user)
+	jwtToken, err := createToken(user)
 	if err != nil {
 		http.Error(w, `{"error":"Lỗi tạo token"}`, http.StatusInternalServerError)
 		return
 	}
 
 	// Thu hồi phiên đăng nhập cũ của cùng tài khoản (chỉ cho phép 1 thiết bị đăng nhập tại 1 thời điểm)
-	globalTokenRevocationStore.SetActiveUserToken(user.Username, token, time.Now().Add(7*24*time.Hour))
+	token.Global().SetActiveUserToken(user.Username, jwtToken, time.Now().Add(7*24*time.Hour))
 
 	// Ghi nhận lịch sử đăng nhập thành công với IP thực
 	recordAccessLog(user.Username, user.Role, "login", clientIP, fmt.Sprintf("Đăng nhập thành công với vai trò '%s'", user.Role))
@@ -1081,7 +1107,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":        "Đăng nhập thành công!",
-		"token":          token,
+		"token":          jwtToken,
 		"user":           user,
 		"stream_key":     streamKeyStr,
 		"publish_secret": publishSecretStr,
@@ -1113,13 +1139,13 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 			exp = time.Now().Add(24 * time.Hour)
 		}
 		if tokenStr != "" {
-			globalTokenRevocationStore.RevokeToken(tokenStr, exp)
+			token.Global().RevokeToken(tokenStr, exp)
 		}
 	} else if tokenStr != "" {
-		globalTokenRevocationStore.RevokeToken(tokenStr, time.Now().Add(24*time.Hour))
+		token.Global().RevokeToken(tokenStr, time.Now().Add(24*time.Hour))
 	}
 
-	recordAccessLog(username, role, "logout", getClientIP(r), "Đăng xuất khỏi hệ thống và thu hồi token")
+	recordAccessLog(username, role, "logout", limiter.GetClientIP(r), "Đăng xuất khỏi hệ thống và thu hồi token")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Đã ghi nhận đăng xuất"})
 }
@@ -2371,6 +2397,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Khởi tạo rate limiters
+	limiter.InitRateLimiters()
+
 	// Khởi tạo MongoDB và seed tài khoản admin01 / 123456
 	initMongoDB()
 

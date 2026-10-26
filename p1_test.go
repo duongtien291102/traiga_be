@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
+
+	"livestream-be/internal/security/limiter"
 )
 
 // P1-1: Kiểm tra phân quyền và IDOR trên DELETE /api/keys
@@ -106,9 +108,9 @@ func TestP1_1_AdminRoomBots_Authorization(t *testing.T) {
 
 // P1-2: Rate Limiting cho HTTP Login
 func TestP1_2_RateLimiter_Login(t *testing.T) {
-	initRateLimiters()
+	limiter.InitRateLimiters()
 	testIP := "198.51.100.42"
-	loginLimiter.Reset(testIP)
+	limiter.LoginLimiter.Reset(testIP)
 
 	handler := RateLimitLoginMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -143,7 +145,7 @@ func TestP1_2_RateLimiter_Login(t *testing.T) {
 
 	// Địa chỉ IP khác vẫn phải được phép (không bị chặn theo chuỗi)
 	otherIP := "198.51.100.99"
-	loginLimiter.Reset(otherIP)
+	limiter.LoginLimiter.Reset(otherIP)
 	reqOther := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
 	reqOther.RemoteAddr = otherIP + ":12345"
 	wOther := httptest.NewRecorder()
@@ -510,8 +512,8 @@ func TestPhase2_InputValidation_XSSAndRegister(t *testing.T) {
 	}
 
 	// 2. registerHandler: kiểm tra độ dài username/password
-	initRateLimiters()
-	registerLimiter.Reset("203.0.113.10")
+	limiter.InitRateLimiters()
+	limiter.RegisterLimiter.Reset("203.0.113.10")
 
 	t.Run("Reject short username", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"ab","password":"password123"}`))
@@ -536,9 +538,9 @@ func TestPhase2_InputValidation_XSSAndRegister(t *testing.T) {
 
 // Giai đoạn 2: Kiểm tra Rate Limit trên POST /api/auth/register
 func TestPhase2_RegisterRateLimit(t *testing.T) {
-	initRateLimiters()
+	limiter.InitRateLimiters()
 	testIP := "203.0.113.55"
-	registerLimiter.Reset(testIP)
+	limiter.RegisterLimiter.Reset(testIP)
 
 	for i := 1; i <= 5; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"username":"ab","password":"123"}`))
@@ -605,4 +607,3 @@ func TestPhase2_3_CORSAndSecurityHeaders(t *testing.T) {
 		}
 	})
 }
-
