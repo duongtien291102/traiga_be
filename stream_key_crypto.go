@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -22,8 +23,17 @@ import (
 
 var streamSecretEncryptionKey []byte
 var streamSecretHashKey []byte
+var streamSecretFallbackKey []byte
 
 const encryptedPublishSecretPrefix = "enc:v1:"
+
+// initFallbackCrypto derives a fallback encryption key using JWT_SECRET if available.
+func initFallbackCrypto() {
+	if len(jwtSecret) >= 32 {
+		fallbackEnc := sha256.Sum256([]byte("traiga/publish-secret/encryption/v1\x00" + string(jwtSecret)))
+		streamSecretFallbackKey = fallbackEnc[:]
+	}
+}
 
 // initStreamKeyCrypto derives separate encryption and lookup keys. A dedicated
 // secret is preferred; JWT_SECRET remains a backwards-compatible fallback.
@@ -40,6 +50,7 @@ func initStreamKeyCrypto() error {
 	hash := sha256.Sum256([]byte("traiga/publish-secret/hmac/v1\x00" + master))
 	streamSecretEncryptionKey = enc[:]
 	streamSecretHashKey = hash[:]
+	initFallbackCrypto()
 	return nil
 }
 
@@ -107,6 +118,57 @@ func decryptPublishSecret(encrypted string) (string, error) {
 		return "", fmt.Errorf("decrypt publish secret: %w", err)
 	}
 	return string(plaintext), nil
+}
+
+func decryptWithKey(encrypted string, key []byte) (string, error) {
+	if len(key) != 32 {
+		return "", errors.New("invalid encryption key length")
+	}
+	if !strings.HasPrefix(encrypted, encryptedPublishSecretPrefix) {
+		return "", errors.New("publish secret is not encrypted with a supported version")
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encrypted, encryptedPublishSecretPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decode encrypted publish secret: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(encoded) < aead.NonceSize() {
+		return "", errors.New("encrypted publish secret is truncated")
+	}
+	nonce, ciphertext := encoded[:aead.NonceSize()], encoded[aead.NonceSize():]
+	plaintext, err := aead.Open(nil, nonce, ciphertext, []byte(encryptedPublishSecretPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decrypt publish secret: %w", err)
+	}
+	return string(plaintext), nil
+}
+
+// decryptPublishSecretWithFallback attempts decryption with the primary key first,
+// and falls back to streamSecretFallbackKey (derived from JWT_SECRET) if different.
+func decryptPublishSecretWithFallback(encrypted string) (string, bool, error) {
+	plaintext, err := decryptPublishSecret(encrypted)
+	if err == nil {
+		return plaintext, false, nil
+	}
+
+	if len(streamSecretFallbackKey) != 32 {
+		initFallbackCrypto()
+	}
+
+	fallbackKey := streamSecretFallbackKey
+	if len(fallbackKey) == 32 && subtle.ConstantTimeCompare(streamSecretEncryptionKey, fallbackKey) != 1 {
+		if s, decErr := decryptWithKey(encrypted, fallbackKey); decErr == nil {
+			return s, true, nil
+		}
+	}
+	return "", false, err
 }
 
 func hashPublishSecret(secret string) (string, error) {
@@ -184,6 +246,7 @@ func hydratePublishSecret(key *StreamKey) error {
 
 // migratePublishSecrets initializes a private publish credential for legacy
 // rooms and verifies existing ciphertext before the service accepts publishes.
+// Phase 0.5: Implements dual-key auto-heal and safe corrupt key quarantine.
 func migratePublishSecrets(ctx context.Context) error {
 	if keysColl == nil {
 		return errors.New("stream key database is unavailable")
@@ -201,22 +264,67 @@ func migratePublishSecrets(ctx context.Context) error {
 	for i := range keys {
 		key := &keys[i]
 		if key.PublishSecretEncrypted != "" && key.PublishSecretHash != "" {
-			if _, err := decryptPublishSecret(key.PublishSecretEncrypted); err == nil {
+			secret, usedFallback, err := decryptPublishSecretWithFallback(key.PublishSecretEncrypted)
+			if err == nil {
+				if usedFallback {
+					// Auto-heal: giải mã được bằng JWT_SECRET cũ -> nâng cấp sang primary key mới
+					key.PublishSecret = secret
+					if err := preparePublishSecret(key); err != nil {
+						log.Printf("⚠️ Không thể chuẩn bị secret mới cho phòng %s: %v", key.ID.Hex(), err)
+						continue
+					}
+					filter := bson.M{"_id": key.ID}
+					update := bson.M{"$set": bson.M{
+						"publish_secret_enc":  key.PublishSecretEncrypted,
+						"publish_secret_hash": key.PublishSecretHash,
+						"updated_at":          time.Now(),
+					}}
+					if _, err := keysColl.UpdateOne(ctx, filter, update); err != nil {
+						log.Printf("⚠️ Lỗi cập nhật auto-heal publish secret cho phòng %s: %v", key.ID.Hex(), err)
+						continue
+					}
+					log.Printf("⚠️ [AUTO-HEAL] Phòng '%s' đã tự động nâng cấp khóa mã hóa mới", key.ID.Hex())
+					recordAccessLog("system", "systemadmin", "key_auto_healed", "127.0.0.1", fmt.Sprintf("Phòng %s được nâng cấp lên khóa mã hóa mới", key.ID.Hex()))
+				}
 				continue
-			} else {
-				return fmt.Errorf("cannot decrypt publish secret for room %s: %w", key.ID.Hex(), err)
 			}
+
+			// Cả primary và fallback đều thất bại -> Key corrupt, cô lập an toàn (is_active: false)
+			log.Printf("⛔ [SECURITY QUARANTINE] Phòng '%s' có khóa phát bị hỏng, đã tạm thời vô hiệu hóa (is_active: false): %v", key.ID.Hex(), err)
+			filter := bson.M{"_id": key.ID}
+			update := bson.M{"$set": bson.M{
+				"is_active":  false,
+				"updated_at": time.Now(),
+			}}
+			if _, updErr := keysColl.UpdateOne(ctx, filter, update); updErr != nil {
+				log.Printf("⚠️ Không thể cập nhật trạng thái cô lập cho phòng %s: %v", key.ID.Hex(), updErr)
+			}
+			recordAccessLog("system", "systemadmin", "stream_key_corrupted", "127.0.0.1", fmt.Sprintf("Phòng %s bị hỏng khóa phát, đã tạm thời vô hiệu hóa", key.ID.Hex()))
+			// Phase 0.5: KHÔNG return fatal error, cho phép server boot an toàn
+			continue
 		}
 
 		if key.PublishSecretEncrypted != "" {
-			secret, err := decryptPublishSecret(key.PublishSecretEncrypted)
+			secret, _, err := decryptPublishSecretWithFallback(key.PublishSecretEncrypted)
 			if err != nil {
-				return fmt.Errorf("cannot decrypt publish secret for room %s: %w", key.ID.Hex(), err)
+				log.Printf("⛔ [SECURITY QUARANTINE] Phòng '%s' có khóa phát legacy bị hỏng, đã tạm thời vô hiệu hóa (is_active: false): %v", key.ID.Hex(), err)
+				filter := bson.M{"_id": key.ID}
+				update := bson.M{"$set": bson.M{
+					"is_active":  false,
+					"updated_at": time.Now(),
+				}}
+				if _, updErr := keysColl.UpdateOne(ctx, filter, update); updErr != nil {
+					log.Printf("⚠️ Không thể cô lập phòng %s: %v", key.ID.Hex(), updErr)
+				}
+				recordAccessLog("system", "systemadmin", "stream_key_corrupted", "127.0.0.1", fmt.Sprintf("Phòng %s bị hỏng khóa phát legacy, đã tạm thời vô hiệu hóa", key.ID.Hex()))
+				continue
 			}
 			key.PublishSecret = secret
 		}
+
 		if err := preparePublishSecret(key); err != nil {
-			return err
+			log.Printf("⚠️ Không thể khởi tạo publish secret cho phòng %s: %v", key.ID.Hex(), err)
+			continue
 		}
 		filter := bson.M{"_id": key.ID}
 		update := bson.M{"$set": bson.M{
@@ -225,7 +333,8 @@ func migratePublishSecrets(ctx context.Context) error {
 			"updated_at":          time.Now(),
 		}}
 		if _, err := keysColl.UpdateOne(ctx, filter, update); err != nil {
-			return fmt.Errorf("migrate publish secret for room %s: %w", key.ID.Hex(), err)
+			log.Printf("⚠️ Lỗi lưu publish secret mới cho phòng %s: %v", key.ID.Hex(), err)
+			continue
 		}
 	}
 	return nil
