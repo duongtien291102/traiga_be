@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -27,6 +25,7 @@ import (
 	"livestream-be/internal/security/limiter"
 	"livestream-be/internal/security/token"
 	"livestream-be/internal/store"
+	"livestream-be/internal/stream"
 )
 
 // Type aliases for gradual refactoring (Phase 2)
@@ -64,11 +63,7 @@ var (
 )
 
 func streamKeyCredentials(keys []StreamKey) []StreamKeyCredential {
-	credentials := make([]StreamKeyCredential, 0, len(keys))
-	for _, key := range keys {
-		credentials = append(credentials, StreamKeyCredential{StreamKey: key, PublishSecret: key.PublishSecret})
-	}
-	return credentials
+	return stream.StreamKeyCredentials(keys)
 }
 
 var (
@@ -96,18 +91,29 @@ var userAuthHandler = auth.NewHandler(
 )
 
 
+var streamHandler = stream.NewHandler(
+	func() *store.Store { return globalStore },
+	func() []byte { return jwtSecret },
+	verifySRSWebhookSecret,
+	publishSecretMatches,
+	publishSecretFromSRSParam,
+	hydratePublishSecret,
+	streamKeyForStorage,
+	findStreamKeyByID,
+	insertStreamKey,
+	recordAccessLog,
+	resetRoomChat,
+	func(room string) {
+		if globalBotManager != nil {
+			globalBotManager.StopBots(room)
+		}
+	},
+	canAdminManageStreamOrSession,
+)
+
 // maskIP che giấu địa chỉ IP của streamer để bảo vệ quyền riêng tư
 func maskIP(ip string) string {
-	if ip == "" {
-		return "***"
-	}
-	parts := strings.Split(ip, ":")
-	host := parts[0]
-	dotParts := strings.Split(host, ".")
-	if len(dotParts) == 4 {
-		return fmt.Sprintf("%s.%s.%s.***", dotParts[0], dotParts[1], dotParts[2])
-	}
-	return "***"
+	return stream.MaskIP(ip)
 }
 
 // generateSecureRandomPassword tạo mật khẩu an toàn ngẫu nhiên độ dài chỉ định
@@ -121,76 +127,13 @@ func generateSecureRandomPassword(length int) string {
 
 // generateStreamKey returns a high-entropy key suitable for RTMP publishing.
 func generateStreamKey() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
+	return stream.GenerateStreamKey()
 }
 
 // ensureAdminStreamKeys migrates username-based legacy keys and creates a key
 // for admins that do not have one yet.
 func ensureAdminStreamKeys(ctx context.Context, user User) ([]StreamKey, error) {
-	if keysColl == nil {
-		return nil, fmt.Errorf("stream key database is unavailable")
-	}
-	filter := bson.M{"$or": []bson.M{{"user_id": user.ID}, {"streamer": user.FullName}, {"streamer": user.Username}}}
-	cursor, err := keysColl.Find(ctx, filter)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]StreamKey, 0)
-	if err := cursor.All(ctx, &keys); err != nil {
-		_ = cursor.Close(ctx)
-		return nil, err
-	}
-	_ = cursor.Close(ctx)
-
-	for i := range keys {
-		if keys[i].PublishSecret == "" {
-			if err := hydratePublishSecret(&keys[i]); err != nil {
-				return nil, fmt.Errorf("không thể mở khóa phát của phòng %s: %w", keys[i].ID.Hex(), err)
-			}
-		}
-		if strings.EqualFold(keys[i].Key, user.Username) {
-			newKey, err := generateStreamKey()
-			if err != nil {
-				return nil, err
-			}
-			storedKey, err := streamKeyForStorage(keys[i])
-			if err != nil {
-				return nil, err
-			}
-			if _, err := keysColl.UpdateOne(ctx, bson.M{"_id": keys[i].ID}, bson.M{"$set": bson.M{
-				"key":                 newKey,
-				"publish_secret_enc":  storedKey.PublishSecretEncrypted,
-				"publish_secret_hash": storedKey.PublishSecretHash,
-			}}); err != nil {
-				return nil, err
-			}
-			keys[i].Key = newKey
-		}
-	}
-
-	if len(keys) == 0 {
-		newKey, err := generateStreamKey()
-		if err != nil {
-			return nil, err
-		}
-		key := StreamKey{Key: newKey, Title: fmt.Sprintf("Kênh %s", user.FullName), Streamer: user.FullName, UserID: &user.ID, IsActive: true, CreatedAt: time.Now()}
-		storedKey, err := streamKeyForStorage(key)
-		if err != nil {
-			return nil, err
-		}
-		result, err := keysColl.InsertOne(ctx, storedKey)
-		if err != nil {
-			return nil, err
-		}
-		key = storedKey
-		key.ID = result.InsertedID.(primitive.ObjectID)
-		keys = append(keys, key)
-	}
-	return keys, nil
+	return streamHandler.EnsureAdminStreamKeys(ctx, user)
 }
 
 // initJWTSecret kiểm tra và nạp JWT_SECRET bắt buộc từ môi trường
@@ -441,20 +384,8 @@ func createToken(user User) (string, error) {
 }
 
 // verifySRSWebhookSecret xác thực Secret Token cho các SRS Webhook (/auth, /auth/unpublish, /auth/dvr)
-// Nếu biến môi trường SRS_WEBHOOK_SECRET được cấu hình, bắt buộc phải khớp qua Header X-SRS-Webhook-Secret hoặc query ?secret=
 func verifySRSWebhookSecret(r *http.Request) bool {
-	expected := strings.TrimSpace(os.Getenv("SRS_WEBHOOK_SECRET"))
-	if expected == "" {
-		return true
-	}
-	provided := strings.TrimSpace(r.Header.Get("X-SRS-Webhook-Secret"))
-	if provided == "" {
-		provided = strings.TrimSpace(r.URL.Query().Get("secret"))
-	}
-	if provided == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+	return stream.VerifySRSWebhookSecret(r)
 }
 
 var validUsernameRegex = auth.ValidUsernameRegex
@@ -465,269 +396,23 @@ func getUserFromAuthHeader(r *http.Request) (*JWTClaims, error) {
 }
 
 // verifyStreamKey kiểm tra Stream Key hợp lệ trong MongoDB và bắt buộc chủ sở hữu phải có role == "admin"
-// TÀI KHOẢN SYSTEMADMIN VÀ USER BÌNH THƯỜNG TUYỆT ĐỐI KHÔNG ĐƯỢC PHÉP LIVESTREAM
 func verifyStreamKey(streamKey, publishSecret string) bool {
-	mongoMutex.RLock()
-	ready := isMongoReady
-	coll := keysColl
-	uColl := usersColl
-	mongoMutex.RUnlock()
-
-	if ready && coll != nil && uColl != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		var keyDoc StreamKey
-		err := coll.FindOne(ctx, bson.M{"key": streamKey, "is_active": true}).Decode(&keyDoc)
-		if err != nil {
-			log.Printf("⛔ [AUTH BLOCKED] Phòng '%s' không tồn tại hoặc đã bị khóa", streamKey)
-			return false
-		}
-		if !publishSecretMatches(publishSecret, keyDoc.PublishSecretHash) {
-			log.Printf("⛔ [AUTH BLOCKED] Sai publish secret cho phòng '%s'", streamKey)
-			return false
-		}
-
-		// YÊU CẦU: CHỈ CÓ TÀI KHOẢN CÓ ROLE LÀ ADMIN MỚI ĐƯỢC LIVESTREAM
-		if keyDoc.UserID != nil {
-			var u User
-			if err := uColl.FindOne(ctx, bson.M{"_id": keyDoc.UserID}).Decode(&u); err == nil {
-				if u.Role == "systemadmin" {
-					log.Printf("⛔ [AUTH REJECTED] Phòng '%s' thuộc tài khoản SystemAdmin '%s'. Tài khoản SystemAdmin TUYỆT ĐỐI KHÔNG ĐƯỢC PHÉP LIVESTREAM!", streamKey, u.Username)
-					return false
-				}
-				if u.Role != "admin" {
-					log.Printf("⛔ [AUTH REJECTED] Phòng '%s' thuộc user '%s' (role: '%s'). Chỉ tài khoản role 'admin' mới được livestream!", streamKey, u.Username, u.Role)
-					return false
-				}
-				log.Printf("👑 [AUTH APPROVED] Admin '%s' đang phát sóng phòng '%s'", u.Username, streamKey)
-				return true
-			}
-			log.Printf("⛔ [AUTH BLOCKED] Không tìm thấy tài khoản sở hữu phòng '%s'", streamKey)
-			return false
-		}
-
-		// Legacy key records may not have user_id; resolve their streamer label
-		// against the accounts table, but still require the secret above.
-		if keyDoc.Streamer != "" {
-			var owner User
-			ownerName := strings.ToLower(strings.TrimSpace(keyDoc.Streamer))
-			ownerErr := uColl.FindOne(ctx, bson.M{"username": ownerName}).Decode(&owner)
-			if ownerErr != nil {
-				ownerErr = uColl.FindOne(ctx, bson.M{"full_name": keyDoc.Streamer}).Decode(&owner)
-			}
-			if ownerErr == nil && owner.Role == "admin" {
-				log.Printf("👑 [AUTH APPROVED] Admin '%s' đang phát sóng phòng '%s'", owner.Username, streamKey)
-				return true
-			}
-		}
-		log.Printf("⛔ [AUTH BLOCKED] Phòng '%s' không thuộc tài khoản Admin nào", streamKey)
-		return false
-	}
-
-	// Fail closed when the credential store is unavailable. Static default
-	// room names are public identifiers and must never authorize publishing.
-	log.Printf("⛔ [AUTH BLOCKED] Không thể xác thực phòng '%s' khi cơ sở dữ liệu không sẵn sàng", streamKey)
-	return false
+	return stream.VerifyStreamKey(context.Background(), globalStore, streamKey, publishSecret, publishSecretMatches)
 }
 
 // verifyInternalABRStream only allows loopback FFmpeg publishers to publish
-// generated renditions, and only for an existing active room owned by an admin.
 func verifyInternalABRStream(app, streamKey, clientIP string) bool {
-	if app != "abr" || (clientIP != "127.0.0.1" && clientIP != "::1" && clientIP != "localhost") {
-		return false
-	}
-
-	roomKey := ""
-	for _, suffix := range []string{"_720p", "_480p", "_360p"} {
-		if strings.HasSuffix(streamKey, suffix) {
-			roomKey = strings.TrimSuffix(streamKey, suffix)
-			break
-		}
-	}
-	if roomKey == "" {
-		return false
-	}
-
-	mongoMutex.RLock()
-	ready, coll, uColl := isMongoReady, keysColl, usersColl
-	mongoMutex.RUnlock()
-	if !ready || coll == nil || uColl == nil {
-		return false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	var room StreamKey
-	if err := coll.FindOne(ctx, bson.M{"key": roomKey, "is_active": true}).Decode(&room); err != nil {
-		return false
-	}
-	var owner User
-	if room.UserID != nil {
-		if err := uColl.FindOne(ctx, bson.M{"_id": room.UserID}).Decode(&owner); err != nil {
-			return false
-		}
-	} else {
-		name := strings.ToLower(strings.TrimSpace(room.Streamer))
-		if err := uColl.FindOne(ctx, bson.M{"username": name}).Decode(&owner); err != nil {
-			if err := uColl.FindOne(ctx, bson.M{"full_name": room.Streamer}).Decode(&owner); err != nil {
-				return false
-			}
-		}
-	}
-	return owner.Role == "admin"
+	return stream.VerifyInternalABRStream(context.Background(), globalStore, app, streamKey, clientIP)
 }
 
 // recordLiveSession ghi nhận phiên live mới và chốt các phiên cũ chưa đóng
 func recordLiveSession(streamKey, app, clientIP string) {
-	mongoMutex.RLock()
-	ready := isMongoReady
-	coll := sessionsColl
-	kColl := keysColl
-	mongoMutex.RUnlock()
-
-	if !ready || coll == nil {
-		return
-	}
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		streamerName := "Admin"
-		if kColl != nil {
-			var kDoc StreamKey
-			if err := kColl.FindOne(ctx, bson.M{"key": streamKey}).Decode(&kDoc); err == nil && kDoc.Streamer != "" {
-				streamerName = kDoc.Streamer
-			}
-		}
-
-		now := time.Now()
-		// Đóng các session 'live' cũ của cùng stream key này
-		_, _ = coll.UpdateMany(ctx,
-			bson.M{"stream_key": streamKey, "status": "live"},
-			bson.M{"$set": bson.M{"status": "ended", "ended_at": now}},
-		)
-
-		session := LiveSession{
-			StreamKey: streamKey,
-			Streamer:  streamerName,
-			App:       app,
-			ClientIP:  clientIP,
-			Status:    "live",
-			StartedAt: now,
-		}
-		_, _ = coll.InsertOne(ctx, session)
-		recordAccessLog(streamerName, "admin", "start_stream", clientIP, fmt.Sprintf("Bắt đầu phát sóng luồng '%s' (App: %s)", streamKey, app))
-
-		// Mỗi lần live mới bắt đầu: Phát lệnh reset kênh chat cho client (toàn bộ tin nhắn vẫn được lưu trữ vĩnh viễn trong DB)
-		resetRoomChat(streamKey)
-	}()
+	streamHandler.RecordLiveSession(streamKey, app, clientIP)
 }
 
 // unpublishHandler xử lý webhook khi luồng live dừng (từ SRS on_unpublish)
 func unpublishHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !verifySRSWebhookSecret(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid SRS Webhook Secret"}`)
-		return
-	}
-
-	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
-	var streamKey, clientAddr, appName string
-	contentType := r.Header.Get("Content-Type")
-
-	if strings.Contains(contentType, "application/json") {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-		if len(body) > 0 {
-			var payload SRSAuthPayload
-			if err := json.Unmarshal(body, &payload); err == nil {
-				streamKey = strings.TrimSpace(payload.Stream)
-				if streamKey == "" {
-					streamKey = strings.TrimSpace(payload.Name)
-				}
-				clientAddr = payload.IP
-				appName = payload.App
-			}
-		}
-	}
-
-	if streamKey == "" {
-		if err := r.ParseForm(); err == nil {
-			streamKey = strings.TrimSpace(r.FormValue("stream"))
-			if streamKey == "" {
-				streamKey = strings.TrimSpace(r.FormValue("name"))
-			}
-			if clientAddr == "" {
-				clientAddr = r.FormValue("addr")
-			}
-			if appName == "" {
-				appName = r.FormValue("app")
-			}
-		}
-	}
-
-	if clientAddr == "" {
-		clientAddr = getClientIP(r)
-	}
-	if appName == "abr" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"code":0}`)
-		return
-	}
-
-	log.Printf("⏹️ [STREAM UNPUBLISH] Luồng live kết thúc - Key: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
-
-	mongoMutex.RLock()
-	ready := isMongoReady
-	coll := sessionsColl
-	mongoMutex.RUnlock()
-
-	if ready && coll != nil && streamKey != "" {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			var latest LiveSession
-			opts := options.FindOne().SetSort(bson.M{"started_at": -1})
-			err := coll.FindOne(ctx, bson.M{"stream_key": streamKey, "status": "live"}, opts).Decode(&latest)
-			if err == nil {
-				now := time.Now()
-				duration := int64(now.Sub(latest.StartedAt).Seconds())
-				if duration < 0 {
-					duration = 0
-				}
-				_, _ = coll.UpdateOne(ctx, bson.M{"_id": latest.ID}, bson.M{
-					"$set": bson.M{
-						"status":           "ended",
-						"ended_at":         now,
-						"duration_seconds": duration,
-					},
-				})
-				recordAccessLog(latest.Streamer, "admin", "stop_stream", clientAddr, fmt.Sprintf("Kết thúc luồng '%s'. Thời lượng: %d giây", streamKey, duration))
-			}
-			// Dừng bot tương tác trong phòng live khi streamer kết thúc live
-			globalBotManager.StopBots(streamKey)
-
-			// Luồng kết thúc: Phát lệnh reset kênh chat cho client (toàn bộ tin nhắn vẫn được lưu trữ vĩnh viễn trong DB)
-			resetRoomChat(streamKey)
-		}()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `{"code":0}`)
+	streamHandler.Unpublish(w, r)
 }
 
 // corsMiddleware xử lý CORS (theo danh sách ALLOWED_ORIGINS), HTTP Security Headers và giới hạn kích thước Body
@@ -796,469 +481,23 @@ func profileHandler(w http.ResponseWriter, r *http.Request) {
 
 // apiKeysHandler quản lý Stream Keys
 func apiKeysHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case http.MethodGet:
-		claims, err := getUserFromAuthHeader(r)
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập để truy cập danh sách Stream Keys"})
-			return
-		}
-		if claims.Role != "admin" && claims.Role != "systemadmin" {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Chỉ Quản trị viên mới được xem Stream Keys"})
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		var filter bson.M
-		if claims.Role == "systemadmin" {
-			filter = bson.M{}
-		} else {
-			// Admin chỉ xem các Stream Key do chính mình sở hữu
-			objID, errID := primitive.ObjectIDFromHex(claims.UserID)
-			if errID == nil {
-				filter = bson.M{
-					"$or": []bson.M{
-						{"user_id": objID},
-						{"streamer": claims.Username},
-					},
-				}
-			} else {
-				filter = bson.M{"streamer": claims.Username}
-			}
-		}
-
-		if keysColl == nil {
-			json.NewEncoder(w).Encode([]StreamKey{})
-			return
-		}
-
-		cursor, err := keysColl.Find(ctx, filter)
-		if err != nil {
-			http.Error(w, `{"error":"Lỗi truy vấn"}`, http.StatusInternalServerError)
-			return
-		}
-		defer cursor.Close(ctx)
-
-		keys := make([]StreamKey, 0)
-		_ = cursor.All(ctx, &keys)
-		json.NewEncoder(w).Encode(keys)
-
-	case http.MethodPost:
-		// Tạo key mới (DÀNH CHO ADMIN HOẶC SYSTEMADMIN)
-		claims, err := getUserFromAuthHeader(r)
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
-			return
-		}
-		if claims.Role != "admin" && claims.Role != "systemadmin" {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ tài khoản Admin hoặc SystemAdmin mới có quyền tạo Stream Key"})
-			return
-		}
-
-		limitRequestBody(w, r, SmallJSONMaxBodyBytes)
-		var req struct {
-			Key           string `json:"key"`
-			Title         string `json:"title"`
-			Streamer      string `json:"streamer"`
-			UserID        string `json:"user_id"`
-			AdminUsername string `json:"admin_username"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"Dữ liệu JSON không hợp lệ"}`, http.StatusBadRequest)
-			return
-		}
-
-		cleanKey := strings.ToLower(strings.TrimSpace(req.Key))
-		if cleanKey == "" {
-			http.Error(w, `{"error":"Khóa luồng không được để trống"}`, http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		var newKey StreamKey
-		newKey.Key = cleanKey
-		newKey.Title = strings.TrimSpace(req.Title)
-		if newKey.Title == "" {
-			newKey.Title = fmt.Sprintf("Kênh %s", cleanKey)
-		}
-
-		if claims.Role == "systemadmin" {
-			// SystemAdmin tạo key và gán cho Admin được chỉ định
-			var targetAdmin User
-			var found bool
-
-			// 1. Tìm theo user_id nếu có
-			if req.UserID != "" {
-				if objID, errID := primitive.ObjectIDFromHex(req.UserID); errID == nil {
-					if errFind := usersColl.FindOne(ctx, bson.M{"_id": objID, "role": "admin"}).Decode(&targetAdmin); errFind == nil {
-						found = true
-					}
-				}
-			}
-
-			// 2. Tìm theo admin_username
-			if !found && req.AdminUsername != "" {
-				if errFind := usersColl.FindOne(ctx, bson.M{"username": strings.ToLower(strings.TrimSpace(req.AdminUsername)), "role": "admin"}).Decode(&targetAdmin); errFind == nil {
-					found = true
-				}
-			}
-
-			// 3. Tìm theo streamer name
-			if !found && req.Streamer != "" {
-				if errFind := usersColl.FindOne(ctx, bson.M{"username": strings.ToLower(strings.TrimSpace(req.Streamer)), "role": "admin"}).Decode(&targetAdmin); errFind == nil {
-					found = true
-				}
-			}
-
-			// 4. Fallback tìm bất kỳ admin nào
-			if !found {
-				_ = usersColl.FindOne(ctx, bson.M{"role": "admin"}).Decode(&targetAdmin)
-			}
-
-			if targetAdmin.ID != primitive.NilObjectID {
-				newKey.UserID = &targetAdmin.ID
-				newKey.Streamer = targetAdmin.FullName
-				if newKey.Streamer == "" {
-					newKey.Streamer = targetAdmin.Username
-				}
-			} else {
-				newKey.Streamer = "Admin"
-			}
-		} else {
-			// Admin tự tạo key cho mình
-			objID, _ := primitive.ObjectIDFromHex(claims.UserID)
-			newKey.UserID = &objID
-			newKey.Streamer = claims.Username
-		}
-		newKey.IsActive = true
-		newKey.CreatedAt = time.Now()
-
-		newKey, insertErr := insertStreamKey(ctx, newKey)
-		if insertErr != nil {
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Stream Key này đã tồn tại!"})
-			return
-		}
-		recordAccessLog(claims.Username, claims.Role, "create_key", getClientIP(r),
-			fmt.Sprintf("Tạo khóa luồng mới '%s' cho Streamer '%s'", newKey.Key, newKey.Streamer))
-
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(newKey)
-
-	case http.MethodDelete:
-		// Xóa Stream Key (dành cho Admin hoặc SystemAdmin)
-		claims, err := getUserFromAuthHeader(r)
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập để thực hiện thao tác"})
-			return
-		}
-		if claims.Role != "admin" && claims.Role != "systemadmin" {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Chỉ Quản trị viên mới được xóa Stream Key"})
-			return
-		}
-
-		keyParam := strings.TrimSpace(r.URL.Query().Get("key"))
-		if keyParam == "" {
-			http.Error(w, `{"error":"Thiếu tham số key"}`, http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if keysColl == nil {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa luồng"})
-			return
-		}
-
-		// 1. Tìm thông tin Stream Key mục tiêu
-		var targetKey StreamKey
-		errFind := keysColl.FindOne(ctx, bson.M{"key": keyParam}).Decode(&targetKey)
-		if errFind != nil {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa luồng"})
-			return
-		}
-
-		// 2. Kiểm tra quyền sở hữu (IDOR protection)
-		// Admin CHỈ ĐƯỢC PHÉP xóa key của chính mình; SystemAdmin được xóa mọi key
-		if claims.Role != "systemadmin" {
-			callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
-			if errID != nil {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: ID người dùng không hợp lệ"})
-				return
-			}
-
-			// Kiểm tra user_id trong MongoDB
-			isOwner := false
-			if targetKey.UserID != nil && *targetKey.UserID == callerObjID {
-				isOwner = true
-			}
-
-			if !isOwner {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
-				return
-			}
-		}
-
-		res, err := keysColl.DeleteOne(ctx, bson.M{"_id": targetKey.ID})
-		if err != nil || res.DeletedCount == 0 {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Không thể xóa khóa"})
-			return
-		}
-
-		recordAccessLog(claims.Username, claims.Role, "delete_key", getClientIP(r),
-			fmt.Sprintf("Xóa khóa luồng '%s'", keyParam))
-
-		json.NewEncoder(w).Encode(map[string]string{"message": "Đã xóa Stream Key thành công"})
-
-	default:
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-	}
+	streamHandler.Keys(w, r)
 }
 
 // revealPublishSecretHandler only returns the decrypted credential after an
 // authenticated owner explicitly requests it. List APIs never include it.
 func revealPublishSecretHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store, max-age=0")
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	claims, err := getUserFromAuthHeader(r)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
-		return
-	}
-	if claims.Role != "admin" && claims.Role != "systemadmin" {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Admin mới được xem khóa phát"})
-		return
-	}
-	if keysColl == nil {
-		http.Error(w, `{"error":"Cơ sở dữ liệu chưa sẵn sàng"}`, http.StatusServiceUnavailable)
-		return
-	}
-	id, err := primitive.ObjectIDFromHex(strings.TrimSpace(r.URL.Query().Get("id")))
-	if err != nil {
-		http.Error(w, `{"error":"ID khóa không hợp lệ"}`, http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	targetKey, err := findStreamKeyByID(ctx, id)
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa phát"})
-		return
-	}
-	if claims.Role != "systemadmin" {
-		callerID, errID := primitive.ObjectIDFromHex(claims.UserID)
-		ownsKey := errID == nil && targetKey.UserID != nil && *targetKey.UserID == callerID
-		if !ownsKey && targetKey.UserID == nil {
-			ownsKey = strings.EqualFold(targetKey.Streamer, claims.Username)
-		}
-		if !ownsKey {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Bạn không sở hữu khóa phát này"})
-			return
-		}
-	}
-	if err := hydratePublishSecret(&targetKey); err != nil {
-		http.Error(w, `{"error":"Không thể mở khóa phát"}`, http.StatusInternalServerError)
-		return
-	}
-	recordAccessLog(claims.Username, claims.Role, "reveal_publish_secret", getClientIP(r), fmt.Sprintf("Xem khóa phát của phòng '%s'", targetKey.Key))
-	json.NewEncoder(w).Encode(map[string]string{"publish_secret": targetKey.PublishSecret})
+	streamHandler.RevealPublishSecret(w, r)
 }
 
 // toggleKeyHandler cho phép Admin bật/tắt Stream Key của chính mình (hoặc SystemAdmin bật/tắt mọi Stream Key)
 func toggleKeyHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	claims, err := getUserFromAuthHeader(r)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
-		return
-	}
-	if claims.Role != "admin" && claims.Role != "systemadmin" {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Quản trị viên (Admin hoặc SystemAdmin) mới có quyền bật/tắt Key"})
-		return
-	}
-
-	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
-	var req struct {
-		Key      string `json:"key"`
-		IsActive bool   `json:"is_active"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"Dữ liệu không hợp lệ"}`, http.StatusBadRequest)
-		return
-	}
-
-	req.Key = strings.TrimSpace(req.Key)
-	if req.Key == "" {
-		http.Error(w, `{"error":"Thiếu tham số key"}`, http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Kiểm tra quyền sở hữu Stream Key (chống IDOR: tránh admin02 khóa key của admin01)
-	if keysColl != nil {
-		var targetKey StreamKey
-		if errFind := keysColl.FindOne(ctx, bson.M{"key": req.Key}).Decode(&targetKey); errFind != nil {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy khóa luồng"})
-			return
-		}
-		if claims.Role != "systemadmin" {
-			callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
-			if errID != nil || targetKey.UserID == nil || *targetKey.UserID != callerObjID {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
-				return
-			}
-		}
-
-		_, err = keysColl.UpdateOne(ctx, bson.M{"_id": targetKey.ID}, bson.M{"$set": bson.M{"is_active": req.IsActive}})
-		if err != nil {
-			http.Error(w, `{"error":"Lỗi cập nhật"}`, http.StatusInternalServerError)
-			return
-		}
-	} else {
-		if !canAdminManageStreamOrSession(ctx, claims, req.Key, "") {
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
-			return
-		}
-	}
-
-	recordAccessLog(claims.Username, claims.Role, "toggle_key", getClientIP(r),
-		fmt.Sprintf("Cập nhật trạng thái khóa '%s' thành %v", req.Key, req.IsActive))
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":   "Cập nhật trạng thái thành công!",
-		"key":       req.Key,
-		"is_active": req.IsActive,
-	})
+	streamHandler.ToggleKey(w, r)
 }
 
 // apiSessionsHandler xem lịch sử phiên live (Admin xem của mình, SystemAdmin xem toàn bộ, bảo vệ IP streamer)
 func apiSessionsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	claims, err := getUserFromAuthHeader(r)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập để truy cập lịch sử phiên live"})
-		return
-	}
-	if claims.Role != "admin" && claims.Role != "systemadmin" {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối"})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var filter bson.M
-	if claims.Role == "systemadmin" {
-		filter = bson.M{}
-	} else {
-		// Admin chỉ xem lịch sử live của chính mình
-		filter = bson.M{
-			"$or": []bson.M{
-				{"streamer": claims.Username},
-				{"stream_key": claims.Username},
-			},
-		}
-	}
-
-	if sessionsColl == nil {
-		json.NewEncoder(w).Encode([]interface{}{})
-		return
-	}
-
-	opts := options.Find().SetSort(bson.M{"started_at": -1}).SetLimit(50)
-	cursor, err := sessionsColl.Find(ctx, filter, opts)
-	if err != nil {
-		http.Error(w, `{"error":"Lỗi truy vấn sessions"}`, http.StatusInternalServerError)
-		return
-	}
-	defer cursor.Close(ctx)
-
-	var sessions []LiveSession
-	_ = cursor.All(ctx, &sessions)
-
-	// Bảo vệ quyền riêng tư: Mặt nạ hóa địa chỉ IP streamer
-	type SafeLiveSession struct {
-		ID              primitive.ObjectID `json:"id"`
-		StreamKey       string             `json:"stream_key"`
-		Streamer        string             `json:"streamer"`
-		Title           string             `json:"title,omitempty"`
-		App             string             `json:"app"`
-		ClientIP        string             `json:"client_ip"`
-		Status          string             `json:"status"`
-		StartedAt       time.Time          `json:"started_at"`
-		EndedAt         *time.Time         `json:"ended_at,omitempty"`
-		DurationSeconds int64              `json:"duration_seconds"`
-		ReplayURL       string             `json:"replay_url,omitempty"`
-		DriveFileID     string             `json:"drive_file_id,omitempty"`
-		RecordStatus    string             `json:"record_status,omitempty"`
-	}
-
-	safeSessions := make([]SafeLiveSession, 0, len(sessions))
-	for _, s := range sessions {
-		clientIP := "***"
-		if claims.Role == "systemadmin" {
-			clientIP = maskIP(s.ClientIP)
-		}
-		safeSessions = append(safeSessions, SafeLiveSession{
-			ID:              s.ID,
-			StreamKey:       s.StreamKey,
-			Streamer:        s.Streamer,
-			Title:           s.Title,
-			App:             s.App,
-			ClientIP:        clientIP,
-			Status:          s.Status,
-			StartedAt:       s.StartedAt,
-			EndedAt:         s.EndedAt,
-			DurationSeconds: s.DurationSeconds,
-			ReplayURL:       s.ReplayURL,
-			DriveFileID:     s.DriveFileID,
-			RecordStatus:    s.RecordStatus,
-		})
-	}
-
-	json.NewEncoder(w).Encode(safeSessions)
+	streamHandler.Sessions(w, r)
 }
 
 // apiUsersHandler danh sách người dùng (Admin & SystemAdmin có thể xem)
@@ -1447,94 +686,7 @@ func sysadminLiveStatsHandler(w http.ResponseWriter, r *http.Request) {
 
 // authHandler xử lý webhook xác thực từ SRS hoặc Nginx-RTMP
 func authHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !verifySRSWebhookSecret(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid SRS Webhook Secret"}`)
-		return
-	}
-
-	limitRequestBody(w, r, SmallJSONMaxBodyBytes)
-	var streamKey, publishSecret, clientAddr, appName, param string
-	contentType := r.Header.Get("Content-Type")
-
-	// 1. Parse JSON từ SRS Media Server
-	if strings.Contains(contentType, "application/json") {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-		if len(body) > 0 {
-			var payload SRSAuthPayload
-			if err := json.Unmarshal(body, &payload); err == nil {
-				streamKey = strings.TrimSpace(payload.Stream)
-				if streamKey == "" {
-					streamKey = strings.TrimSpace(payload.Name)
-				}
-				clientAddr = payload.IP
-				appName = payload.App
-				param = payload.Param
-			}
-		}
-	}
-
-	// 2. Parse Form-data từ Nginx-RTMP
-	if streamKey == "" {
-		if err := r.ParseForm(); err == nil {
-			streamKey = strings.TrimSpace(r.FormValue("stream"))
-			if streamKey == "" {
-				streamKey = strings.TrimSpace(r.FormValue("name"))
-			}
-			if clientAddr == "" {
-				clientAddr = r.FormValue("addr")
-			}
-			if appName == "" {
-				appName = r.FormValue("app")
-			}
-			param = r.FormValue("param")
-			publishSecret = r.FormValue("publish_secret")
-		} else if strings.Contains(err.Error(), "http: request body too large") {
-			http.Error(w, `{"error":"Payload too large"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-	}
-
-	if clientAddr == "" {
-		clientAddr = getClientIP(r)
-	}
-	if publishSecret == "" {
-		publishSecret = publishSecretFromSRSParam(param)
-	}
-
-	// Kiểm tra tính hợp lệ và đang hoạt động trong MongoDB
-	if streamKey != "" && verifyInternalABRStream(appName, streamKey, clientAddr) {
-		log.Printf("[AUTH SUCCESS] Internal ABR rendition allowed - Room rendition: '%s'", streamKey)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"code":0}`)
-		return
-	}
-
-	if streamKey != "" && appName != "abr" && verifyStreamKey(streamKey, publishSecret) {
-		log.Printf("[AUTH SUCCESS] Stream allowed (MongoDB verified) - Room: '%s' | App: '%s' | Client: %s", streamKey, appName, clientAddr)
-		recordLiveSession(streamKey, appName, clientAddr)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"code":0}`)
-		return
-	}
-
-	log.Printf("[AUTH FAILED] Stream denied - Room: '%s' (không hợp lệ hoặc publish secret sai) | Client: %s", streamKey, clientAddr)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusForbidden)
-	fmt.Fprint(w, `{"code":403,"error":"Forbidden: Invalid or Disabled Stream Key"}`)
+	streamHandler.Auth(w, r)
 }
 
 // healthHandler kiểm tra trạng thái hoạt động của server và MongoDB
