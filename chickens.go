@@ -90,11 +90,7 @@ func apiPublicRoomsHandler(w http.ResponseWriter, r *http.Request) {
 
 		viewers := 0
 		if globalChatHub != nil {
-			globalChatHub.mutex.RLock()
-			if clients, ok := globalChatHub.rooms[k.Key]; ok {
-				viewers = len(clients)
-			}
-			globalChatHub.mutex.RUnlock()
+			viewers = globalChatHub.ViewerCount(k.Key)
 		}
 
 		farmName := k.Streamer

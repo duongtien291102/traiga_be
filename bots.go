@@ -38,7 +38,7 @@ var globalBotManager = bot.NewRunnerManager(
 			maskedOut := WSOutboundMessage{Type: "chat", Data: &maskedMsg}
 			if publicBytes, marshalErr := json.Marshal(maskedOut); marshalErr == nil {
 				if globalChatHub != nil {
-					globalChatHub.broadcast <- broadcastEvent{streamKey: streamKey, message: publicBytes, ownerMessage: ownerBytes}
+					globalChatHub.BroadcastMessage(streamKey, publicBytes, ownerBytes)
 				}
 			}
 		}
@@ -51,7 +51,7 @@ var globalBotManager = bot.NewRunnerManager(
 		}
 		if b, err := json.Marshal(out); err == nil {
 			if globalChatHub != nil {
-				globalChatHub.broadcast <- broadcastEvent{streamKey: streamKey, message: b}
+				globalChatHub.BroadcastMessage(streamKey, b, nil)
 			}
 		}
 	},
