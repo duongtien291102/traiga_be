@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,15 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"crypto/rand"
-	"encoding/hex"
 	"github.com/joho/godotenv"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"golang.org/x/crypto/bcrypt"
 
+	"livestream-be/internal/admin"
 	"livestream-be/internal/auth"
 	"livestream-be/internal/model"
 	"livestream-be/internal/security/limiter"
@@ -111,6 +105,11 @@ var streamHandler = stream.NewHandler(
 	canAdminManageStreamOrSession,
 )
 
+var adminHandler = admin.NewHandler(
+	func() *store.Store { return globalStore },
+	func() []byte { return jwtSecret },
+)
+
 // maskIP che giấu địa chỉ IP của streamer để bảo vệ quyền riêng tư
 func maskIP(ip string) string {
 	return stream.MaskIP(ip)
@@ -118,11 +117,7 @@ func maskIP(ip string) string {
 
 // generateSecureRandomPassword tạo mật khẩu an toàn ngẫu nhiên độ dài chỉ định
 func generateSecureRandomPassword(length int) string {
-	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("AdminSec@%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
+	return store.GenerateSecureRandomPassword(length)
 }
 
 // generateStreamKey returns a high-entropy key suitable for RTMP publishing.
@@ -242,139 +237,8 @@ func recordAccessLog(username, role, action, ip, details string) {
 
 // seedDefaultData khởi tạo tài khoản quản trị an toàn (không dùng mật khẩu mặc định, không log mật khẩu)
 func seedDefaultData() {
-	if !isMongoReady {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// 1. Khởi tạo tài khoản Tổng Quản Trị Hệ Thống (sysadmin)
-	var sysUser User
-	errSys := usersColl.FindOne(ctx, bson.M{"username": "sysadmin"}).Decode(&sysUser)
-	if errSys != nil {
-		sysPass := strings.TrimSpace(os.Getenv("INITIAL_SYSADMIN_PASSWORD"))
-		if sysPass == "" {
-			sysPass = generateSecureRandomPassword(16)
-			log.Printf("🛡️ [SYSADMIN BOOTSTRAP] Tài khoản 'sysadmin' đã được tạo lần đầu với mật khẩu an toàn ngẫu nhiên. Vui lòng thiết lập INITIAL_SYSADMIN_PASSWORD trong biến môi trường để chỉ định mật khẩu mong muốn.")
-		} else {
-			log.Printf("🛡️ [SYSADMIN BOOTSTRAP] Khởi tạo tài khoản 'sysadmin' từ biến môi trường INITIAL_SYSADMIN_PASSWORD.")
-		}
-
-		hashedPass, err := bcrypt.GenerateFromPassword([]byte(sysPass), bcrypt.DefaultCost)
-		if err == nil {
-			sysadmin := User{
-				Username:  "sysadmin",
-				Password:  string(hashedPass),
-				FullName:  "Tổng Quản Trị Hệ Thống",
-				Role:      "systemadmin",
-				CreatedAt: time.Now(),
-			}
-			res, err := usersColl.InsertOne(ctx, sysadmin)
-			if err == nil {
-				log.Printf("🛡️ [SYSADMIN READY] Khởi tạo tài khoản System Admin thành công (ID: %s)", res.InsertedID.(primitive.ObjectID).Hex())
-				recordAccessLog("sysadmin", "systemadmin", "init_system", "127.0.0.1", "Khởi tạo tài khoản System Admin ban đầu an toàn")
-			}
-		}
-	} else {
-		log.Printf("🛡️ [SYSADMIN READY] Tài khoản System Admin 'sysadmin' đã sẵn sàng.")
-	}
-
-	// 2. Khởi tạo tài khoản admin01 (role: admin - được cấp quyền live)
-	var adminUser User
-	errAdmin := usersColl.FindOne(ctx, bson.M{"username": "admin01"}).Decode(&adminUser)
-	if errAdmin != nil {
-		adminPass := strings.TrimSpace(os.Getenv("INITIAL_ADMIN_PASSWORD"))
-		if adminPass == "" {
-			adminPass = generateSecureRandomPassword(16)
-			log.Printf("👑 [ADMIN BOOTSTRAP] Tài khoản 'admin01' đã được tạo lần đầu với mật khẩu an toàn ngẫu nhiên. Vui lòng thiết lập INITIAL_ADMIN_PASSWORD trong biến môi trường để chỉ định mật khẩu mong muốn.")
-		} else {
-			log.Printf("👑 [ADMIN BOOTSTRAP] Khởi tạo tài khoản 'admin01' từ biến môi trường INITIAL_ADMIN_PASSWORD.")
-		}
-
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(adminPass), bcrypt.DefaultCost)
-		if err == nil {
-			admin := User{
-				Username:  "admin01",
-				Password:  string(hashedPassword),
-				FullName:  "Quản trị viên Streamer",
-				Role:      "admin",
-				CreatedAt: time.Now(),
-			}
-			res, err := usersColl.InsertOne(ctx, admin)
-			if err == nil {
-				log.Printf("👑 [ADMIN READY] Khởi tạo tài khoản Admin thành công (ID: %s)", res.InsertedID.(primitive.ObjectID).Hex())
-			}
-		}
-	} else {
-		log.Printf("👑 [ADMIN READY] Tài khoản Admin 'admin01' đã sẵn sàng.")
-	}
-
-	// Khởi tạo hai tài khoản chủ trại và dữ liệu danh mục trong MongoDB.
-	ensureSeedAdmin := func(username, fullName, passwordEnv string) (primitive.ObjectID, bool) {
-		var existing User
-		if err := usersColl.FindOne(ctx, bson.M{"username": username}).Decode(&existing); err == nil {
-			return existing.ID, true
-		}
-		password := strings.TrimSpace(os.Getenv(passwordEnv))
-		if password == "" {
-			password = generateSecureRandomPassword(16)
-			log.Printf("[ADMIN BOOTSTRAP] Tài khoản '%s' tạo mật khẩu ngẫu nhiên. Đặt %s để chỉ định mật khẩu.", username, passwordEnv)
-		}
-		hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-		if err != nil {
-			log.Printf("[ADMIN BOOTSTRAP] Không thể mã hóa mật khẩu cho %s: %v", username, err)
-			return primitive.NilObjectID, false
-		}
-		result, err := usersColl.InsertOne(ctx, User{Username: username, Password: string(hashed), FullName: fullName, Role: "admin", CreatedAt: time.Now()})
-		if err != nil {
-			log.Printf("[ADMIN BOOTSTRAP] Không thể tạo tài khoản %s: %v", username, err)
-			return primitive.NilObjectID, false
-		}
-		return result.InsertedID.(primitive.ObjectID), true
-	}
-
-	seedAdmins := []struct {
-		username string
-		name     string
-		key      string
-		ms       string
-		weight   string
-		style    string
-	}{
-		{"admin05", "Chủ Trại Thành Trung 05", "thanhtrung05", "MS 501", "2.95 kg", "Lối ôm đấm kiềng hầu, đá mé giáp lưng"},
-		{"admin06", "Chủ Trại Thành Trung 06", "thanhtrung06", "MS 601", "3.10 kg", "Mé xỏ ngang, đánh giáp lưng dạt sườn"},
-	}
-	for _, seed := range seedAdmins {
-		adminID, ok := ensureSeedAdmin(seed.username, seed.name, "INITIAL_"+strings.ToUpper(seed.username)+"_PASSWORD")
-		if !ok {
-			continue
-		}
-		_, _ = keysColl.UpdateOne(ctx, bson.M{"key": seed.key}, bson.M{"$setOnInsert": StreamKey{
-			Key: seed.key, Title: seed.name + " — Trực Tiếp Giao Lưu Chiến Kê", Streamer: seed.name,
-			UserID: &adminID, IsActive: true, MS: seed.ms, Chang: seed.weight, Loi: seed.style, CreatedAt: time.Now(),
-		}}, options.Update().SetUpsert(true))
-
-		if chickensColl == nil {
-			continue
-		}
-		count, _ := chickensColl.CountDocuments(ctx, bson.M{"created_by": seed.username})
-		if count > 0 {
-			continue
-		}
-		chicken := Chicken{
-			ID: primitive.NewObjectID(), MS: seed.ms,
-			Title: seed.name + " — Chiến kê giao lưu " + seed.weight,
-			Breed: "don", BreedName: "Gà Đòn Long Biên Tuyển Chọn", Chang: seed.weight,
-			Age: "11 tháng tơ", CanVay: "Huyền trâm đóng đúng chậu, chân vuông sừng", Loi: seed.style,
-			DatNuoc: "Đã dạt 2 nước chuẩn", Price: 3500000, PriceText: "3.500.000 đ",
-			Farm: seed.name, SellerName: seed.name, Location: "Long Biên, Hà Nội",
-			Image:  "https://images.unsplash.com/photo-1548550023-2bdb3c5beed7?q=80&w=800&auto=format&fit=crop",
-			Status: "available", UserID: &adminID, CreatedBy: seed.username, CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		}
-		if _, err := chickensColl.InsertOne(ctx, chicken); err != nil {
-			log.Printf("[CHICKEN SEED] Không thể tạo dữ liệu cho %s: %v", seed.username, err)
-		}
+	if globalStore != nil {
+		globalStore.SeedDefaultData(context.Background(), recordAccessLog)
 	}
 }
 
@@ -509,14 +373,7 @@ func apiUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 // requireSystemAdmin xác thực token và kiểm tra role == "systemadmin"
 func requireSystemAdmin(r *http.Request) (*JWTClaims, error) {
-	claims, err := getUserFromAuthHeader(r)
-	if err != nil {
-		return nil, fmt.Errorf("chưa đăng nhập hoặc phiên làm việc hết hạn")
-	}
-	if claims.Role != "systemadmin" {
-		return nil, fmt.Errorf("truy cập bị từ chối: Chỉ tài khoản Tổng Quản Trị (SystemAdmin) mới có quyền!")
-	}
-	return claims, nil
+	return adminHandler.RequireSystemAdmin(r)
 }
 
 // sysadminUsersHandler quản trị danh sách người dùng, tạo tài khoản Admin mới, đổi role, xóa tài khoản
@@ -526,160 +383,12 @@ func sysadminUsersHandler(w http.ResponseWriter, r *http.Request) {
 
 // sysadminLogsHandler trả về lịch sử vào/ra và các thao tác trong hệ thống
 func sysadminLogsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, err := requireSystemAdmin(r)
-	if err != nil {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	filter := bson.M{}
-	actionFilter := r.URL.Query().Get("action")
-	if actionFilter != "" {
-		filter["action"] = actionFilter
-	}
-	userFilter := r.URL.Query().Get("username")
-	if userFilter != "" {
-		filter["username"] = userFilter
-	}
-
-	opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(100)
-	cursor, err := accessLogsColl.Find(ctx, filter, opts)
-	if err != nil {
-		http.Error(w, `{"error":"Lỗi truy vấn logs"}`, http.StatusInternalServerError)
-		return
-	}
-	defer cursor.Close(ctx)
-
-	var logs []AccessLog
-	_ = cursor.All(ctx, &logs)
-	json.NewEncoder(w).Encode(logs)
+	adminHandler.Logs(w, r)
 }
 
 // sysadminLiveStatsHandler trả về thống kê tổng hợp giờ live, tần suất và danh sách phiên live
 func sysadminLiveStatsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, err := requireSystemAdmin(r)
-	if err != nil {
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// 1. Lấy tất cả phiên live gần nhất
-	opts := options.Find().SetSort(bson.M{"started_at": -1}).SetLimit(200)
-	cursor, err := sessionsColl.Find(ctx, bson.M{}, opts)
-	if err != nil {
-		http.Error(w, `{"error":"Lỗi truy vấn"}`, http.StatusInternalServerError)
-		return
-	}
-	defer cursor.Close(ctx)
-
-	var allSessions []LiveSession
-	_ = cursor.All(ctx, &allSessions)
-
-	var totalDurationSeconds int64 = 0
-	activeSessions := 0
-	type StreamerSummary struct {
-		Streamer             string    `json:"streamer"`
-		StreamKey            string    `json:"stream_key"`
-		TotalSessions        int       `json:"total_sessions"`
-		TotalDurationSeconds int64     `json:"total_duration_seconds"`
-		LastLiveAt           time.Time `json:"last_live_at"`
-		IsLive               bool      `json:"is_live"`
-	}
-
-	type DailySummary struct {
-		Date                 string `json:"date"`
-		SessionCount         int    `json:"session_count"`
-		TotalDurationSeconds int64  `json:"total_duration_seconds"`
-	}
-
-	streamerMap := make(map[string]*StreamerSummary)
-	dailyMap := make(map[string]*DailySummary)
-
-	for _, s := range allSessions {
-		duration := s.DurationSeconds
-		if s.Status == "live" {
-			activeSessions++
-			// Tính thời gian tạm thời cho phiên đang diễn ra
-			duration = int64(time.Since(s.StartedAt).Seconds())
-		}
-		totalDurationSeconds += duration
-
-		// Gom nhóm theo Streamer / Key
-		groupKey := s.Streamer
-		if groupKey == "" {
-			groupKey = s.StreamKey
-		}
-		if _, ok := streamerMap[groupKey]; !ok {
-			streamerMap[groupKey] = &StreamerSummary{
-				Streamer:   groupKey,
-				StreamKey:  s.StreamKey,
-				LastLiveAt: s.StartedAt,
-			}
-		}
-		summary := streamerMap[groupKey]
-		summary.TotalSessions++
-		summary.TotalDurationSeconds += duration
-		if s.StartedAt.After(summary.LastLiveAt) {
-			summary.LastLiveAt = s.StartedAt
-		}
-		if s.Status == "live" {
-			summary.IsLive = true
-		}
-
-		// Gom nhóm theo Ngày (YYYY-MM-DD)
-		dateStr := s.StartedAt.Format("2006-01-02")
-		if _, ok := dailyMap[dateStr]; !ok {
-			dailyMap[dateStr] = &DailySummary{Date: dateStr}
-		}
-		dSum := dailyMap[dateStr]
-		dSum.SessionCount++
-		dSum.TotalDurationSeconds += duration
-	}
-
-	var streamerList []StreamerSummary
-	for _, v := range streamerMap {
-		streamerList = append(streamerList, *v)
-	}
-
-	// 7 ngày gần nhất
-	var dailyList []DailySummary
-	for i := 6; i >= 0; i-- {
-		d := time.Now().AddDate(0, 0, -i).Format("2006-01-02")
-		if ds, ok := dailyMap[d]; ok {
-			dailyList = append(dailyList, *ds)
-		} else {
-			dailyList = append(dailyList, DailySummary{
-				Date:                 d,
-				SessionCount:         0,
-				TotalDurationSeconds: 0,
-			})
-		}
-	}
-
-	// Đếm tổng users và admins
-	userCount, _ := usersColl.CountDocuments(ctx, bson.M{})
-	adminCount, _ := usersColl.CountDocuments(ctx, bson.M{"role": "admin"})
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_sessions":         len(allSessions),
-		"total_duration_seconds": totalDurationSeconds,
-		"active_sessions":        activeSessions,
-		"total_users":            userCount,
-		"total_admins":           adminCount,
-		"streamer_stats":         streamerList,
-		"daily_stats":            dailyList,
-		"sessions":               allSessions,
-	})
+	adminHandler.LiveStats(w, r)
 }
 
 // ==================== SRS WEBHOOK ====================
