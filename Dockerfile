@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # Biên dịch binary tĩnh (CGO_ENABLED=0)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/livestream-be .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/livestream-be ./cmd/server
 
 # Runtime image siêu nhẹ
 FROM alpine:3.20
