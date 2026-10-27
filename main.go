@@ -103,6 +103,12 @@ var streamHandler = stream.NewHandler(
 		}
 	},
 	canAdminManageStreamOrSession,
+	func(room string) int {
+		if globalChatHub != nil {
+			return globalChatHub.ViewerCount(room)
+		}
+		return 0
+	},
 )
 
 var adminHandler = admin.NewHandler(

@@ -35,6 +35,7 @@ type Handler struct {
 	ResetRoomChat                  func(room string)
 	StopBots                       func(room string)
 	CanAdminManageStreamOrSession func(ctx context.Context, claims *model.JWTClaims, streamKey, streamer string) bool
+	GetViewerCount                 func(room string) int
 }
 
 // NewHandler tạo mới Stream Handler
@@ -52,6 +53,7 @@ func NewHandler(
 	resetRoomChat func(room string),
 	stopBots func(room string),
 	canAdminManageStreamOrSession func(ctx context.Context, claims *model.JWTClaims, streamKey, streamer string) bool,
+	getViewerCount func(room string) int,
 ) *Handler {
 	return &Handler{
 		GetStore:                       getStore,
@@ -67,6 +69,7 @@ func NewHandler(
 		ResetRoomChat:                  resetRoomChat,
 		StopBots:                       stopBots,
 		CanAdminManageStreamOrSession: canAdminManageStreamOrSession,
+		GetViewerCount:                 getViewerCount,
 	}
 }
 
@@ -895,3 +898,91 @@ func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
 
 	_ = json.NewEncoder(w).Encode(safeSessions)
 }
+
+// PublicRoomInfo chứa thông tin phòng live công khai hiển thị cho người xem
+type PublicRoomInfo struct {
+	ID       string `json:"id"`
+	Key      string `json:"key"`
+	Title    string `json:"title"`
+	Farm     string `json:"farm"`
+	Streamer string `json:"streamer"`
+	MS       string `json:"ms"`
+	Chang    string `json:"chang"`
+	Loi      string `json:"loi"`
+	CanVay   string `json:"can_vay"`
+	DatNuoc  string `json:"dat_nuoc"`
+	Thumb    string `json:"thumb"`
+	IsLive   bool   `json:"is_live"`
+	Viewers  int    `json:"viewers"`
+}
+
+// PublicRooms trả về danh sách các phòng live công khai cho người xem trên web từ MongoDB
+func (h *Handler) PublicRooms(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	st := h.GetStore()
+	if st == nil || !st.IsReady() || st.Keys == nil {
+		_ = json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	cursor, err := st.Keys.Find(ctx, bson.M{"is_active": true}, options.Find().SetSort(bson.M{"created_at": 1}))
+	if err != nil {
+		_ = json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var keys []model.StreamKey
+	_ = cursor.All(ctx, &keys)
+
+	result := make([]PublicRoomInfo, 0, len(keys))
+	for _, k := range keys {
+		isLive := false
+		if st.Sessions != nil {
+			var sess model.LiveSession
+			if errSess := st.Sessions.FindOne(ctx, bson.M{"stream_key": k.Key, "status": "live"}).Decode(&sess); errSess == nil {
+				isLive = true
+			}
+		}
+
+		viewers := 0
+		if h.GetViewerCount != nil {
+			viewers = h.GetViewerCount(k.Key)
+		}
+
+		farmName := k.Streamer
+		if !strings.HasPrefix(farmName, "Trại") {
+			farmName = "Trại Gà " + farmName
+		}
+		if !strings.Contains(farmName, "Thành Trung") {
+			farmName = "Trại Gà Thành Trung 01"
+		}
+
+		result = append(result, PublicRoomInfo{
+			ID:       k.Key,
+			Key:      k.Key,
+			Title:    k.Title,
+			Farm:     farmName,
+			Streamer: k.Streamer,
+			MS:       k.MS,
+			Chang:    k.Chang,
+			Loi:      k.Loi,
+			CanVay:   k.CanVay,
+			DatNuoc:  k.DatNuoc,
+			Thumb:    k.Thumb,
+			IsLive:   isLive,
+			Viewers:  viewers,
+		})
+	}
+
+	_ = json.NewEncoder(w).Encode(result)
+}
+
