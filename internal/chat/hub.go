@@ -41,6 +41,46 @@ type Client struct {
 	ClientIP      string
 	Authenticated bool
 	RateLimiter   *limiter.TokenBucket
+	mu            sync.RWMutex
+	closed        bool
+}
+
+// SafeSend gửi dữ liệu an toàn vào channel Send, chống panic send on closed channel
+func (c *Client) SafeSend(msg []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	defer func() {
+		_ = recover()
+	}()
+	select {
+	case c.Send <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+// CloseSend đóng channel Send an toàn đúng 1 lần
+func (c *Client) CloseSend() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.closed = true
+		defer func() {
+			_ = recover()
+		}()
+		close(c.Send)
+	}
+}
+
+// IsClosed kiểm tra xem client đã đóng kết nối chưa
+func (c *Client) IsClosed() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.closed
 }
 
 // GetIP trả về địa chỉ IP thực của client WebSocket.
@@ -94,7 +134,7 @@ func (h *Hub) Run() {
 			if clients, ok := h.Rooms[client.StreamKey]; ok {
 				if _, exists := clients[client]; exists {
 					delete(clients, client)
-					close(client.Send)
+					client.CloseSend()
 					count := len(clients)
 					if count == 0 {
 						delete(h.Rooms, client.StreamKey)
@@ -116,10 +156,8 @@ func (h *Hub) Run() {
 					if client.RoomOwner && len(event.OwnerMessage) > 0 {
 						message = event.OwnerMessage
 					}
-					select {
-					case client.Send <- message:
-					default:
-						close(client.Send)
+					if !client.SafeSend(message) {
+						client.CloseSend()
 						delete(clients, client)
 					}
 				}
@@ -209,7 +247,7 @@ func (c *Client) ReadPump(svc *Service) {
 				Error: "Bạn đang gửi tin nhắn quá nhanh. Vui lòng chậm lại.",
 			}
 			if b, err := json.Marshal(warn); err == nil {
-				c.Send <- b
+				c.SafeSend(b)
 			}
 			continue
 		}
@@ -220,7 +258,7 @@ func (c *Client) ReadPump(svc *Service) {
 				Error: "Yêu cầu hoàn tất xác thực WebSocket (auth_token hoặc auth_guest) trước khi thao tác",
 			}
 			if b, err := json.Marshal(warn); err == nil {
-				c.Send <- b
+				c.SafeSend(b)
 			}
 			continue
 		}
@@ -234,7 +272,7 @@ func (c *Client) ReadPump(svc *Service) {
 			if limiter.LoginLimiter != nil && !limiter.LoginLimiter.Allow(c.GetIP()) {
 				resp.Error = "Quá nhiều lần thử đăng nhập từ địa chỉ này. Vui lòng thử lại sau 1 phút."
 				if b, err := json.Marshal(resp); err == nil {
-					c.Send <- b
+					c.SafeSend(b)
 				}
 				continue
 			}
@@ -246,7 +284,7 @@ func (c *Client) ReadPump(svc *Service) {
 			if st == nil || st.Users == nil {
 				resp.Error = "Cơ sở dữ liệu chưa sẵn sàng, vui lòng thử lại sau giây lát!"
 				if b, err := json.Marshal(resp); err == nil {
-					c.Send <- b
+					c.SafeSend(b)
 				}
 				continue
 			}
@@ -259,7 +297,7 @@ func (c *Client) ReadPump(svc *Service) {
 			if errU != nil || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(pwd)) != nil {
 				resp.Error = "Tên đăng nhập hoặc mật khẩu không chính xác!"
 				if b, err := json.Marshal(resp); err == nil {
-					c.Send <- b
+					c.SafeSend(b)
 				}
 				continue
 			}
@@ -267,7 +305,7 @@ func (c *Client) ReadPump(svc *Service) {
 			if user.Role == "systemadmin" {
 				resp.Error = "⛔ Tài khoản SystemAdmin (Tổng Quản Trị) không có quyền phát sóng! Vui lòng dùng tài khoản Admin."
 				if b, err := json.Marshal(resp); err == nil {
-					c.Send <- b
+					c.SafeSend(b)
 				}
 				continue
 			}
@@ -275,7 +313,7 @@ func (c *Client) ReadPump(svc *Service) {
 			if user.Role != "admin" {
 				resp.Error = "⛔ Tài khoản này là Người xem (User). Chỉ có tài khoản vai trò Admin mới được livestream!"
 				if b, err := json.Marshal(resp); err == nil {
-					c.Send <- b
+					c.SafeSend(b)
 				}
 				continue
 			}
@@ -348,7 +386,7 @@ func (c *Client) ReadPump(svc *Service) {
 			}
 
 			if b, err := json.Marshal(resp); err == nil {
-				c.Send <- b
+				c.SafeSend(b)
 			}
 
 			c.SendChatHistory(svc)
@@ -426,7 +464,7 @@ func (c *Client) ReadPump(svc *Service) {
 				User:    &model.User{Username: displayName, Role: claims.Role, Avatar: userAvatar},
 			}
 			if b, err := json.Marshal(ack); err == nil {
-				c.Send <- b
+				c.SafeSend(b)
 			}
 
 			c.SendChatHistory(svc)
@@ -455,7 +493,7 @@ func (c *Client) ReadPump(svc *Service) {
 				User:    &model.User{Username: gName, Role: "guest"},
 			}
 			if b, err := json.Marshal(ack); err == nil {
-				c.Send <- b
+				c.SafeSend(b)
 			}
 
 			c.SendChatHistory(svc)
@@ -524,12 +562,19 @@ func (c *Client) SendChatHistory(svc *Service) {
 		History: history,
 	}
 	if hBytes, err := json.Marshal(historyMsg); err == nil {
-		c.Send <- hBytes
+		c.SafeSend(hBytes)
 	}
 }
 
 // FallbackToGuest tự động chuyển sang chế độ Khách thay vì đóng socket khi token gặp sự cố.
 func (c *Client) FallbackToGuest(sender string, reason string, svc *Service) {
+	if c.IsClosed() {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+
 	gName := strings.TrimSpace(sender)
 	if gName == "" {
 		gName = fmt.Sprintf("Khách_%d", time.Now().Unix()%10000)
@@ -546,7 +591,7 @@ func (c *Client) FallbackToGuest(sender string, reason string, svc *Service) {
 		Error: reason + ", đã chuyển sang chế độ Khách",
 	}
 	if b, err := json.Marshal(warn); err == nil {
-		c.Send <- b
+		c.SafeSend(b)
 	}
 
 	ack := model.WSOutboundMessage{
@@ -555,10 +600,12 @@ func (c *Client) FallbackToGuest(sender string, reason string, svc *Service) {
 		User:    &model.User{Username: gName, Role: "guest"},
 	}
 	if b, err := json.Marshal(ack); err == nil {
-		c.Send <- b
+		c.SafeSend(b)
 	}
 
-	c.SendChatHistory(svc)
+	if !c.IsClosed() {
+		c.SendChatHistory(svc)
+	}
 }
 
 // WritePump gửi các tin nhắn từ hub ra client và duy trì heartbeat ping.

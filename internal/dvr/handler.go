@@ -189,20 +189,58 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 				},
 			}, opts).Decode(&targetSession)
 
+			// Tự động nhận diện chuỗi phát sóng bị đứt đoạn & nối tiếp do rớt mạng/reconnect
+			// Nếu phiên trước của cùng streamKey vừa kết thúc cách đây dưới 3 phút (thời gian mạng rớt và nối lại),
+			// hệ thống sẽ đánh số Phần 1, Phần 2 để tránh clip ngắn bị rời rạc.
+			// Nếu người dùng chủ động tắt live và quá 3 phút mới live lại, hệ thống coi là buổi live mới độc lập.
+			var prevRecentSession model.LiveSession
+			prevOpts := options.FindOne().SetSort(bson.M{"started_at": -1})
+			prevFilter := bson.M{
+				"stream_key": streamKey,
+				"replay_url": bson.M{"$exists": true, "$ne": ""},
+				"started_at": bson.M{"$gte": now.Add(-12 * time.Hour)},
+				"ended_at":   bson.M{"$gte": now.Add(-3 * time.Minute)},
+			}
+			if errFind == nil {
+				prevFilter["_id"] = bson.M{"$ne": targetSession.ID}
+			}
+			if errPrev := st.Sessions.FindOne(ctx, prevFilter, prevOpts).Decode(&prevRecentSession); errPrev == nil {
+				partIndex := 2
+				if prevRecentSession.PartIndex > 0 {
+					partIndex = prevRecentSession.PartIndex + 1
+				} else {
+					p1Title := fmt.Sprintf("%s (Phần 1)", strings.TrimSuffix(roomTitle, " (Phần 1)"))
+					_, _ = st.Sessions.UpdateOne(ctx, bson.M{"_id": prevRecentSession.ID}, bson.M{
+						"$set": bson.M{
+							"part_index": 1,
+							"title":      p1Title,
+						},
+					})
+				}
+				parentID := prevRecentSession.ID
+				if prevRecentSession.ParentSessionID != nil {
+					parentID = *prevRecentSession.ParentSessionID
+				}
+				targetSession.PartIndex = partIndex
+				targetSession.ParentSessionID = &parentID
+				targetSession.Title = fmt.Sprintf("%s (Phần %d)", strings.TrimSuffix(roomTitle, " (Phần 1)"), partIndex)
+			}
+
 			if errFind != nil {
 				// Nếu chưa có session thì tạo mới
-				targetSession = model.LiveSession{
-					ID:           primitive.NewObjectID(),
-					StreamKey:    streamKey,
-					Streamer:     streamerName,
-					Title:        roomTitle,
-					App:          appName,
-					Status:       "ended",
-					StartedAt:    now,
-					EndedAt:      &now,
-					ReplayURL:    relativeReplayPath,
-					RecordStatus: "ready",
+				targetSession.ID = primitive.NewObjectID()
+				targetSession.StreamKey = streamKey
+				targetSession.Streamer = streamerName
+				if targetSession.Title == "" {
+					targetSession.Title = roomTitle
 				}
+				targetSession.App = appName
+				targetSession.Status = "ended"
+				targetSession.StartedAt = now
+				targetSession.EndedAt = &now
+				targetSession.ReplayURL = relativeReplayPath
+				targetSession.RecordStatus = "ready"
+
 				if _, errInsert := st.Sessions.InsertOne(ctx, targetSession); errInsert != nil {
 					log.Printf("[SRS DVR SESSION ERROR] Không lưu được session cho file %s: %v", relativeReplayPath, errInsert)
 					return
@@ -218,8 +256,16 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 					updateFields["status"] = "ended"
 					updateFields["duration_seconds"] = max(int64(0), int64(now.Sub(targetSession.StartedAt).Seconds()))
 				}
-				if targetSession.Title == "" {
+				if targetSession.Title != "" {
+					updateFields["title"] = targetSession.Title
+				} else {
 					updateFields["title"] = roomTitle
+				}
+				if targetSession.PartIndex > 0 {
+					updateFields["part_index"] = targetSession.PartIndex
+				}
+				if targetSession.ParentSessionID != nil {
+					updateFields["parent_session_id"] = targetSession.ParentSessionID
 				}
 				if _, errUpdate := st.Sessions.UpdateOne(ctx, bson.M{"_id": targetSession.ID}, bson.M{"$set": updateFields}); errUpdate != nil {
 					log.Printf("[SRS DVR SESSION ERROR] Không cập nhật được session %s: %v", targetSession.ID.Hex(), errUpdate)
@@ -397,16 +443,18 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	_ = cursor.All(ctx, &sessions)
 
 	type PublicReplayItem struct {
-		ID              primitive.ObjectID `json:"id"`
-		StreamKey       string             `json:"stream_key"`
-		Streamer        string             `json:"streamer"`
-		Title           string             `json:"title"`
-		StartedAt       time.Time          `json:"started_at"`
-		EndedAt         *time.Time         `json:"ended_at,omitempty"`
-		DurationSeconds int64              `json:"duration_seconds"`
-		ReplayURL       string             `json:"replay_url"`
-		DriveFileID     string             `json:"drive_file_id,omitempty"`
-		RecordStatus    string             `json:"record_status,omitempty"`
+		ID              primitive.ObjectID  `json:"id"`
+		StreamKey       string              `json:"stream_key"`
+		Streamer        string              `json:"streamer"`
+		Title           string              `json:"title"`
+		StartedAt       time.Time           `json:"started_at"`
+		EndedAt         *time.Time          `json:"ended_at,omitempty"`
+		DurationSeconds int64               `json:"duration_seconds"`
+		ReplayURL       string              `json:"replay_url"`
+		DriveFileID     string              `json:"drive_file_id,omitempty"`
+		RecordStatus    string              `json:"record_status,omitempty"`
+		PartIndex       int                 `json:"part_index,omitempty"`
+		ParentSessionID *primitive.ObjectID `json:"parent_session_id,omitempty"`
 	}
 
 	result := make([]PublicReplayItem, 0, len(sessions))
@@ -426,6 +474,8 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 			ReplayURL:       s.ReplayURL,
 			DriveFileID:     s.DriveFileID,
 			RecordStatus:    s.RecordStatus,
+			PartIndex:       s.PartIndex,
+			ParentSessionID: s.ParentSessionID,
 		})
 	}
 

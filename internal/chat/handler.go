@@ -73,8 +73,11 @@ func (h *Handler) HandleWS(w http.ResponseWriter, r *http.Request) {
 	h.Hub.Register <- client
 
 	go func() {
+		defer func() {
+			_ = recover()
+		}()
 		time.Sleep(10 * time.Second)
-		if !client.Authenticated {
+		if !client.IsClosed() && !client.Authenticated {
 			client.FallbackToGuest("", "Tự động kích hoạt chế độ Khách", h.Service)
 		}
 	}()

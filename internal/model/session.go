@@ -19,8 +19,10 @@ type LiveSession struct {
 	EndedAt         *time.Time         `bson:"ended_at,omitempty" json:"ended_at,omitempty"`
 	DurationSeconds int64              `bson:"duration_seconds" json:"duration_seconds"`
 	ReplayURL       string             `bson:"replay_url,omitempty" json:"replay_url,omitempty"`
-	DriveFileID     string             `bson:"drive_file_id,omitempty" json:"drive_file_id,omitempty"`
-	RecordStatus    string             `bson:"record_status,omitempty" json:"record_status,omitempty"`
+	DriveFileID     string              `bson:"drive_file_id,omitempty" json:"drive_file_id,omitempty"`
+	RecordStatus    string              `bson:"record_status,omitempty" json:"record_status,omitempty"`
+	PartIndex       int                 `bson:"part_index,omitempty" json:"part_index,omitempty"`
+	ParentSessionID *primitive.ObjectID `bson:"parent_session_id,omitempty" json:"parent_session_id,omitempty"`
 }
 
 // AccessLog lưu vết lịch sử vào/ra, phiên live và các hoạt động quản trị
