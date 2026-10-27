@@ -27,6 +27,7 @@ import (
 	"livestream-be/internal/model"
 	"livestream-be/internal/security/limiter"
 	"livestream-be/internal/security/token"
+	"livestream-be/internal/store"
 )
 
 // Type aliases for gradual refactoring (Phase 2)
@@ -72,6 +73,7 @@ func streamKeyCredentials(keys []StreamKey) []StreamKeyCredential {
 }
 
 var (
+	globalStore    *store.Store
 	mongoClient    *mongo.Client
 	db             *mongo.Database
 	usersColl      *mongo.Collection
@@ -214,33 +216,25 @@ func initMongoDB() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	clientOptions := options.Client().ApplyURI(uri)
-	client, err := mongo.Connect(ctx, clientOptions)
+	st, err := store.New(uri, dbName)
 	if err != nil {
-		log.Printf("❌ Lỗi cấu hình kết nối MongoDB: %v", err)
-		return
-	}
-
-	if err := client.Ping(ctx, nil); err != nil {
-		log.Printf("❌ Ping MongoDB thất bại: %v", err)
+		log.Printf("❌ Kết nối MongoDB thất bại: %v", err)
 		return
 	}
 
 	mongoMutex.Lock()
-	mongoClient = client
-	db = client.Database(dbName)
-	usersColl = db.Collection("users")
-	keysColl = db.Collection("stream_keys")
-	sessionsColl = db.Collection("live_sessions")
-	chatColl = db.Collection("chat_messages")
-	chickensColl = db.Collection("chickens")
-	accessLogsColl = db.Collection("access_logs")
-	botsColl = db.Collection("chat_bots")
-	roomBotsColl = db.Collection("room_bot_assignments")
-	isMongoReady = true
+	globalStore = st
+	mongoClient = st.Client
+	db = st.DB
+	usersColl = st.Users
+	keysColl = st.Keys
+	sessionsColl = st.Sessions
+	chatColl = st.Chat
+	chickensColl = st.Chickens
+	accessLogsColl = st.AccessLogs
+	botsColl = st.Bots
+	roomBotsColl = st.RoomBots
+	isMongoReady = st.Ready
 	mongoMutex.Unlock()
 
 	log.Printf("✅ Đã kết nối thành công tới MongoDB Atlas (Database: %s)", dbName)
@@ -248,34 +242,8 @@ func initMongoDB() {
 	// Dọn dẹp bot mẫu mock data (nếu có)
 	go cleanMockBots()
 
-	// Tạo index unique cho username và key
-	_, _ = usersColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys:    bson.M{"username": 1},
-		Options: options.Index().SetUnique(true),
-	})
-	_, _ = keysColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys:    bson.M{"key": 1},
-		Options: options.Index().SetUnique(true),
-	})
-	// Index cho Chợ Gà (chickens)
-	_, _ = chickensColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys: bson.D{{Key: "created_at", Value: -1}},
-	})
-	_, _ = chickensColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys: bson.D{{Key: "status", Value: 1}},
-	})
-	// Index cho chat messages
-	_, _ = chatColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys: bson.D{{Key: "stream_key", Value: 1}, {Key: "created_at", Value: -1}},
-	})
-	// Index cho access logs (lịch sử vào ra)
-	_, _ = accessLogsColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys: bson.D{{Key: "created_at", Value: -1}},
-	})
-	// Index cho live sessions
-	_, _ = sessionsColl.Indexes().CreateOne(context.Background(), mongo.IndexModel{
-		Keys: bson.D{{Key: "started_at", Value: -1}},
-	})
+	// Tạo index cho các collection
+	st.CreateIndexes(context.Background())
 
 	// Khởi tạo tài khoản System Admin & Admin mặc định và key mẫu
 	seedDefaultData()
