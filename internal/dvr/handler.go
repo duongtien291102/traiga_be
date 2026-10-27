@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -431,7 +432,18 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 		filter["stream_key"] = streamKey
 	}
 
-	opts := options.Find().SetSort(bson.M{"started_at": -1}).SetLimit(30)
+	limit := int64(100)
+	if lStr := strings.TrimSpace(r.URL.Query().Get("limit")); lStr != "" {
+		if l, err := strconv.ParseInt(lStr, 10, 64); err == nil && l > 0 && l <= 500 {
+			limit = l
+		}
+	}
+	opts := options.Find().SetSort(bson.M{"started_at": -1}).SetLimit(limit)
+	if pStr := strings.TrimSpace(r.URL.Query().Get("page")); pStr != "" {
+		if p, err := strconv.ParseInt(pStr, 10, 64); err == nil && p > 1 {
+			opts.SetSkip((p - 1) * limit)
+		}
+	}
 	cursor, err := st.Sessions.Find(ctx, filter, opts)
 	if err != nil {
 		_ = json.NewEncoder(w).Encode([]interface{}{})
