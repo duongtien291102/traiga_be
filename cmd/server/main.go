@@ -314,8 +314,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 3. Giới hạn kích thước request body mặc định (1 MB) chống DoS
-		limitRequestBody(w, r, DefaultMaxBodyBytes)
+		// 3. Giới hạn kích thước request body (500 MB cho upload, 1 MB mặc định) chống DoS
+		if strings.HasPrefix(r.URL.Path, "/api/sessions/upload") {
+			limitRequestBody(w, r, limiter.UploadMaxBodyBytes)
+		} else {
+			limitRequestBody(w, r, DefaultMaxBodyBytes)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -448,6 +452,8 @@ func main() {
 	mux.HandleFunc("/api/keys/toggle", toggleKeyHandler)
 	mux.HandleFunc("/api/sessions", apiSessionsHandler)
 	mux.HandleFunc("/api/sessions/replay", apiSessionReplayManageHandler)
+	mux.HandleFunc("/api/sessions/upload", apiSessionUploadHandler)
+	mux.HandleFunc("/api/uploads/", serveUploadsHandler)
 	mux.HandleFunc("/api/sessions/archive", archiveReplayHandler)
 	mux.HandleFunc("/api/replays", apiReplaysHandler)
 	mux.HandleFunc("/api/users", apiUsersHandler)

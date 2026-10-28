@@ -31,7 +31,7 @@ func NormalizeReplayURL(raw string) (string, string) {
 		return fmt.Sprintf("https://drive.google.com/file/d/%s/preview", clean), clean
 	}
 	// Cho phép đường dẫn nội bộ /record/... (không chứa ..)
-	if strings.HasPrefix(clean, "/record/") && !strings.Contains(clean, "..") {
+	if (strings.HasPrefix(clean, "/record/") || strings.HasPrefix(clean, "/api/uploads/")) && !strings.Contains(clean, "..") {
 		return clean, ""
 	}
 	// Chỉ cho phép URL có scheme http:// hoặc https:// hợp lệ

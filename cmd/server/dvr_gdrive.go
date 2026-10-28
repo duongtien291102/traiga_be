@@ -70,3 +70,13 @@ func apiReplaysHandler(w http.ResponseWriter, r *http.Request) {
 func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 	dvrHandlerInstance.ManageSessionReplay(w, r)
 }
+
+// apiSessionUploadHandler cho phép Admin / SystemAdmin tải trực tiếp file .mp4 từ máy tính
+func apiSessionUploadHandler(w http.ResponseWriter, r *http.Request) {
+	dvrHandlerInstance.UploadReplay(w, r)
+}
+
+// serveUploadsHandler phục vụ các file MP4 đã tải lên kèm HTTP Range requests (206)
+func serveUploadsHandler(w http.ResponseWriter, r *http.Request) {
+	dvrHandlerInstance.ServeUploads(w, r)
+}

@@ -136,6 +136,9 @@ var (
 // DefaultMaxBodyBytes giới hạn kích thước request body mặc định (1 MB) chống DoS tràn RAM
 const DefaultMaxBodyBytes int64 = 1 << 20 // 1 MB
 
+// UploadMaxBodyBytes gioi han kich thuoc cho upload video xem lai (500 MB)
+const UploadMaxBodyBytes int64 = 500 << 20 // 500 MB
+
 // SmallJSONMaxBodyBytes giới hạn kích thước body cho các API JSON/Auth thông thường (64 KB)
 const SmallJSONMaxBodyBytes int64 = 64 * 1024 // 64 KB
 

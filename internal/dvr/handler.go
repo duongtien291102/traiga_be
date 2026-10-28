@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -675,4 +676,171 @@ func (h *Handler) ManageSessionReplay(w http.ResponseWriter, r *http.Request) {
 		})
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Đã xóa video phát lại khỏi phiên này"})
 	}
+}
+
+// UploadReplay cho phép Admin / SystemAdmin tải trực tiếp file .mp4 từ máy tính lên hệ thống ("ném cả cái file .mp4 lên trên mà không sửa gì cả")
+// POST /api/sessions/upload
+func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, err := h.getUser(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Admin hoặc SystemAdmin mới có quyền tải lên video"})
+		return
+	}
+
+	// Giới hạn 500 MB cho multipart form
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "File tải lên quá lớn hoặc không hợp lệ (tối đa 500MB)"})
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Vui lòng chọn file video (.mp4, .webm, .mov)"})
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext != ".mp4" && ext != ".webm" && ext != ".mov" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ hỗ trợ tải lên file định dạng .mp4, .webm hoặc .mov"})
+		return
+	}
+
+	uploadDir := filepath.Join("objs", "nginx", "html", "record", "uploads")
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		uploadDir = "uploads"
+		_ = os.MkdirAll(uploadDir, 0755)
+	}
+
+	cleanBase := regexp.MustCompile(`[^a-zA-Z0-9_-]+`).ReplaceAllString(strings.TrimSuffix(header.Filename, ext), "_")
+	if cleanBase == "" {
+		cleanBase = "video"
+	}
+	savedFileName := fmt.Sprintf("%d_%s%s", time.Now().Unix(), cleanBase, ext)
+	savedFilePath := filepath.Join(uploadDir, savedFileName)
+
+	destFile, err := os.OpenFile(savedFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		uploadDir = "uploads"
+		_ = os.MkdirAll(uploadDir, 0755)
+		savedFilePath = filepath.Join(uploadDir, savedFileName)
+		destFile, err = os.OpenFile(savedFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi lưu file lên máy chủ"})
+			return
+		}
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, file); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi ghi dữ liệu video"})
+		return
+	}
+	_ = destFile.Sync()
+
+	relativeURL := fmt.Sprintf("/api/uploads/%s", savedFileName)
+	title := strings.TrimSpace(r.FormValue("title"))
+	streamKey := strings.TrimSpace(r.FormValue("stream_key"))
+	if streamKey == "" {
+		streamKey = claims.Username
+	}
+	if title == "" {
+		title = fmt.Sprintf("Video Xem Lại: %s (%s)", cleanBase, time.Now().Format("02/01/2006"))
+	}
+
+	st := h.GetStore()
+	if st != nil && st.IsReady() && st.Sessions != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		sessionIDStr := strings.TrimSpace(r.FormValue("session_id"))
+		if sessionIDStr != "" {
+			if objID, errID := primitive.ObjectIDFromHex(sessionIDStr); errID == nil {
+				_, _ = st.Sessions.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{
+					"$set": bson.M{
+						"replay_url":    relativeURL,
+						"record_status": "ready",
+						"title":         title,
+					},
+				})
+			}
+		} else {
+			now := time.Now()
+			newSession := model.LiveSession{
+				ID:           primitive.NewObjectID(),
+				StreamKey:    streamKey,
+				Streamer:     claims.Username,
+				Title:        title,
+				App:          "live",
+				Status:       "ended",
+				StartedAt:    now,
+				EndedAt:      &now,
+				ReplayURL:    relativeURL,
+				RecordStatus: "ready",
+			}
+			_, _ = st.Sessions.InsertOne(ctx, newSession)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":    "Đã tải lên video thành công không qua chỉnh sửa",
+		"replay_url": relativeURL,
+		"filename":   savedFileName,
+	})
+}
+
+// ServeUploads phục vụ các file MP4 đã tải lên với hỗ trợ đầy đủ Range Request (HTTP 206) để player tua mượt mà
+// GET /api/uploads/{filename}
+func (h *Handler) ServeUploads(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/uploads/")
+	cleanName := filepath.Base(path)
+	if cleanName == "." || cleanName == "/" || strings.Contains(cleanName, "..") {
+		http.Error(w, "Invalid file path", http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join("objs", "nginx", "html", "record", "uploads", cleanName)
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		filePath = filepath.Join("uploads", cleanName)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	ext := strings.ToLower(filepath.Ext(cleanName))
+	switch ext {
+	case ".mp4":
+		w.Header().Set("Content-Type", "video/mp4")
+	case ".webm":
+		w.Header().Set("Content-Type", "video/webm")
+	case ".mov":
+		w.Header().Set("Content-Type", "video/quicktime")
+	}
+
+	http.ServeFile(w, r, filePath)
 }
