@@ -776,18 +776,33 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 
 		sessionIDStr := strings.TrimSpace(r.FormValue("session_id"))
+		var targetSession model.LiveSession
+		now := time.Now()
 		if sessionIDStr != "" {
 			if objID, errID := primitive.ObjectIDFromHex(sessionIDStr); errID == nil {
-				_, _ = st.Sessions.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{
-					"$set": bson.M{
-						"replay_url":    relativeURL,
-						"record_status": "ready",
-						"title":         title,
-					},
-				})
+				_ = st.Sessions.FindOne(ctx, bson.M{"_id": objID}).Decode(&targetSession)
 			}
+		}
+
+		if targetSession.ID.IsZero() && streamKey != "" {
+			// Tìm phiên live gần nhất (trong vòng 24h) của stream_key này để cập nhật đè
+			opts := options.FindOne().SetSort(bson.M{"started_at": -1})
+			_ = st.Sessions.FindOne(ctx, bson.M{
+				"stream_key": streamKey,
+				"started_at": bson.M{"$gte": now.Add(-24 * time.Hour)},
+			}, opts).Decode(&targetSession)
+		}
+
+		if !targetSession.ID.IsZero() {
+			updateFields := bson.M{
+				"replay_url":    relativeURL,
+				"record_status": "ready",
+			}
+			if title != "" {
+				updateFields["title"] = title
+			}
+			_, _ = st.Sessions.UpdateOne(ctx, bson.M{"_id": targetSession.ID}, bson.M{"$set": updateFields})
 		} else {
-			now := time.Now()
 			newSession := model.LiveSession{
 				ID:           primitive.NewObjectID(),
 				StreamKey:    streamKey,
