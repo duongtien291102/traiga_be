@@ -2,9 +2,11 @@ package dvr
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -167,4 +169,41 @@ func UploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 
 	previewURL := fmt.Sprintf("https://drive.google.com/file/d/%s/preview", uploadedFile.ID)
 	return uploadedFile.ID, previewURL, nil
+}
+
+// WaitForDVRNormalization chờ file đánh dấu .avsync-v1 xuất hiện trên SRS VPS (tối đa timeout)
+// để đảm bảo worker FFmpeg đã chuẩn hóa đồng bộ âm thanh - hình ảnh xong trước khi tải.
+func WaitForDVRNormalization(ctx context.Context, vpsRecordURL string, timeout time.Duration) {
+	if vpsRecordURL == "" {
+		return
+	}
+	markerURL := vpsRecordURL + ".avsync-v1"
+	client := &http.Client{Timeout: 3 * time.Second}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, markerURL, nil)
+		if err == nil {
+			resp, errResp := client.Do(req)
+			if errResp == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					log.Printf("🎬 [SRS DVR] Bản ghi đã được chuẩn hóa đồng bộ A/V (.avsync-v1) sẵn sàng tải: %s", vpsRecordURL)
+					return
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				log.Printf("⚠️ [SRS DVR] Quá thời gian chờ .avsync-v1, tiếp tục xử lý bản ghi: %s", vpsRecordURL)
+				return
+			}
+		}
+	}
 }

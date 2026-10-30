@@ -282,6 +282,9 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 					keyPart = "live"
 				}
 				driveFileName := fmt.Sprintf("TraiGa_%s_%s.mp4", keyPart, targetSession.StartedAt.Format("20060102_150405"))
+				log.Printf("⏳ [SRS DVR] Đang đợi hoàn tất chuẩn hóa âm thanh - hình ảnh cho '%s'...", driveFileName)
+				WaitForDVRNormalization(ctx, vpsRecordURL, 45*time.Second)
+
 				log.Printf("☁️ [GOOGLE DRIVE UPLOAD] Đang tải '%s' lên Google Drive...", driveFileName)
 
 				fileID, previewURL, errUp := UploadStreamToGoogleDrive(driveFileName, vpsRecordURL)
@@ -393,7 +396,9 @@ func (h *Handler) ArchiveReplay(w http.ResponseWriter, r *http.Request) {
 		keyPart = "live"
 	}
 	fileName := fmt.Sprintf("TraiGa_%s_%s.mp4", keyPart, session.StartedAt.Format("20060102_150405"))
-	driveID, previewURL, err := UploadStreamToGoogleDrive(fileName, MakeSRSRecordURL(baseURL, session.ReplayURL))
+	recordTargetURL := MakeSRSRecordURL(baseURL, session.ReplayURL)
+	WaitForDVRNormalization(ctx, recordTargetURL, 30*time.Second)
+	driveID, previewURL, err := UploadStreamToGoogleDrive(fileName, recordTargetURL)
 	if err != nil {
 		log.Printf("[REPLAY ARCHIVE] Lưu trữ phiên %s thất bại: %v", objID.Hex(), err)
 		w.WriteHeader(http.StatusBadGateway)
