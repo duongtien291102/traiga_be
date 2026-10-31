@@ -432,9 +432,8 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	filter := bson.M{
-		// Only publish the browser-recorded local backup as the official replay.
-		// SRS DVR recordings are disabled because their A/V sync is unreliable.
-		"replay_url": bson.M{"$regex": `^/api/uploads/`},
+		// Publish only replays stored in durable Google Drive storage.
+		"replay_url": bson.M{"$regex": `^https://drive\.google\.com/file/d/`},
 	}
 	if streamKey := strings.TrimSpace(r.URL.Query().Get("streamKey")); streamKey != "" {
 		filter["stream_key"] = streamKey
@@ -706,11 +705,15 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Giới hạn 500 MB cho multipart form
+	// Giới hạn 500 MB cho multipart form.
+	r.Body = http.MaxBytesReader(w, r.Body, 500<<20)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "File tải lên quá lớn hoặc không hợp lệ (tối đa 500MB)"})
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 
 	file, header, err := r.FormFile("file")
@@ -727,11 +730,11 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ hỗ trợ tải lên file định dạng .mp4, .webm hoặc .mov"})
 		return
 	}
-
-	uploadDir := filepath.Join("objs", "nginx", "html", "record", "uploads")
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		uploadDir = "uploads"
-		_ = os.MkdirAll(uploadDir, 0755)
+	st := h.GetStore()
+	if st == nil || !st.IsReady() || st.Sessions == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Cơ sở dữ liệu chưa sẵn sàng để lưu thông tin video"})
+		return
 	}
 
 	cleanBase := regexp.MustCompile(`[^a-zA-Z0-9_-]+`).ReplaceAllString(strings.TrimSuffix(header.Filename, ext), "_")
@@ -739,30 +742,20 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		cleanBase = "video"
 	}
 	savedFileName := fmt.Sprintf("%d_%s%s", time.Now().Unix(), cleanBase, ext)
-	savedFilePath := filepath.Join(uploadDir, savedFileName)
-
-	destFile, err := os.OpenFile(savedFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		uploadDir = "uploads"
-		_ = os.MkdirAll(uploadDir, 0755)
-		savedFilePath = filepath.Join(uploadDir, savedFileName)
-		destFile, err = os.OpenFile(savedFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi lưu file lên máy chủ"})
-			return
-		}
+	contentType := "video/mp4"
+	switch ext {
+	case ".webm":
+		contentType = "video/webm"
+	case ".mov":
+		contentType = "video/quicktime"
 	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, file); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi ghi dữ liệu video"})
+	driveFileID, relativeURL, err := UploadReaderToGoogleDrive(savedFileName, contentType, file, header.Size)
+	if err != nil {
+		log.Printf("[REPLAY UPLOAD] Google Drive upload failed for %q: %v", savedFileName, err)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể lưu video lên Google Drive. Kiểm tra cấu hình Drive rồi thử lại."})
 		return
 	}
-	_ = destFile.Sync()
-
-	relativeURL := fmt.Sprintf("/api/uploads/%s", savedFileName)
 	title := strings.TrimSpace(r.FormValue("title"))
 	streamKey := strings.TrimSpace(r.FormValue("stream_key"))
 	if streamKey == "" {
@@ -772,7 +765,6 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		title = fmt.Sprintf("Video Xem Lại: %s (%s)", cleanBase, time.Now().Format("02/01/2006"))
 	}
 
-	st := h.GetStore()
 	if st != nil && st.IsReady() && st.Sessions != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -798,7 +790,8 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 		if !targetSession.ID.IsZero() {
 			updateFields := bson.M{
 				"replay_url":    relativeURL,
-				"record_status": "ready",
+				"drive_file_id": driveFileID,
+				"record_status": "uploaded_drive",
 			}
 			if title != "" {
 				updateFields["title"] = title
@@ -815,7 +808,8 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 				StartedAt:    now,
 				EndedAt:      &now,
 				ReplayURL:    relativeURL,
-				RecordStatus: "ready",
+				DriveFileID:  driveFileID,
+				RecordStatus: "uploaded_drive",
 			}
 			_, _ = st.Sessions.InsertOne(ctx, newSession)
 		}
@@ -823,9 +817,11 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":    "Đã tải lên video thành công không qua chỉnh sửa",
-		"replay_url": relativeURL,
-		"filename":   savedFileName,
+		"message":       "Đã lưu video lên Google Drive",
+		"replay_url":    relativeURL,
+		"drive_file_id": driveFileID,
+		"record_status": "uploaded_drive",
+		"filename":      savedFileName,
 	})
 }
 

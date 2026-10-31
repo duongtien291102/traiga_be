@@ -56,13 +56,6 @@ func GetGoogleDriveAccessToken() (string, error) {
 
 // UploadStreamToGoogleDrive tải luồng .mp4 từ SRS VPS và đẩy thẳng lên Google Drive qua Resumable Upload
 func UploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string, error) {
-	accessToken, err := GetGoogleDriveAccessToken()
-	if err != nil {
-		return "", "", err
-	}
-
-	folderID := strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_FOLDER_ID"))
-
 	// 1. Mở kết nối tải file .mp4 từ SRS VPS
 	httpClient := &http.Client{Timeout: 30 * time.Minute}
 	srcResp, err := httpClient.Get(vpsRecordURL)
@@ -74,11 +67,26 @@ func UploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 	if srcResp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("VPS returned status %d for %s", srcResp.StatusCode, vpsRecordURL)
 	}
+	return UploadReaderToGoogleDrive(displayName, "video/mp4", srcResp.Body, srcResp.ContentLength)
+}
+
+// UploadReaderToGoogleDrive lưu một luồng video trực tiếp lên Drive bằng resumable upload.
+func UploadReaderToGoogleDrive(displayName, contentType string, source io.Reader, contentLength int64) (string, string, error) {
+	accessToken, err := GetGoogleDriveAccessToken()
+	if err != nil {
+		return "", "", err
+	}
+
+	folderID := strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_FOLDER_ID"))
+	httpClient := &http.Client{Timeout: 30 * time.Minute}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/octet-stream"
+	}
 
 	// 2. Khởi tạo phiên Resumable Upload trên Google Drive API v3
 	meta := map[string]interface{}{
 		"name":     displayName,
-		"mimeType": "video/mp4",
+		"mimeType": contentType,
 	}
 	if folderID != "" {
 		meta["parents"] = []string{folderID}
@@ -95,9 +103,9 @@ func UploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 	}
 	initReq.Header.Set("Authorization", "Bearer "+accessToken)
 	initReq.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	initReq.Header.Set("X-Upload-Content-Type", "video/mp4")
-	if srcResp.ContentLength > 0 {
-		initReq.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%d", srcResp.ContentLength))
+	initReq.Header.Set("X-Upload-Content-Type", contentType)
+	if contentLength > 0 {
+		initReq.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%d", contentLength))
 	}
 
 	initResp, err := httpClient.Do(initReq)
@@ -116,14 +124,14 @@ func UploadStreamToGoogleDrive(displayName, vpsRecordURL string) (string, string
 		return "", "", fmt.Errorf("missing Location header from Drive resumable upload")
 	}
 
-	// 3. Stream trực tiếp dữ liệu .mp4 từ VPS lên Google Drive (không lưu vào RAM/ổ đĩa Backend)
-	putReq, err := http.NewRequest(http.MethodPut, uploadURL, srcResp.Body)
+	// 3. Stream trực tiếp nội dung lên Drive, không lưu file hoàn chỉnh trong container Backend.
+	putReq, err := http.NewRequest(http.MethodPut, uploadURL, source)
 	if err != nil {
 		return "", "", err
 	}
-	putReq.Header.Set("Content-Type", "video/mp4")
-	if srcResp.ContentLength > 0 {
-		putReq.ContentLength = srcResp.ContentLength
+	putReq.Header.Set("Content-Type", contentType)
+	if contentLength > 0 {
+		putReq.ContentLength = contentLength
 	}
 
 	putResp, err := httpClient.Do(putReq)
