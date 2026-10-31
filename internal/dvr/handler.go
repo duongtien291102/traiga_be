@@ -432,7 +432,9 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	filter := bson.M{
-		"replay_url": bson.M{"$exists": true, "$ne": ""},
+		// Only publish the browser-recorded local backup as the official replay.
+		// SRS DVR recordings are disabled because their A/V sync is unreliable.
+		"replay_url": bson.M{"$regex": `^/api/uploads/`},
 	}
 	if streamKey := strings.TrimSpace(r.URL.Query().Get("streamKey")); streamKey != "" {
 		filter["stream_key"] = streamKey
