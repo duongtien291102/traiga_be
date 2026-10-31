@@ -66,6 +66,10 @@ func apiReplaysHandler(w http.ResponseWriter, r *http.Request) {
 	dvrHandlerInstance.ListReplays(w, r)
 }
 
+func apiDVRReplayFileHandler(w http.ResponseWriter, r *http.Request) {
+	dvrHandlerInstance.ServeDVRReplay(w, r)
+}
+
 // apiSessionReplayManageHandler cho phép Admin / SystemAdmin gắn link Google Drive hoặc xóa bản ghi xem lại
 func apiSessionReplayManageHandler(w http.ResponseWriter, r *http.Request) {
 	dvrHandlerInstance.ManageSessionReplay(w, r)

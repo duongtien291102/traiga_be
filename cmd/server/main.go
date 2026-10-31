@@ -84,7 +84,6 @@ var userAuthHandler = auth.NewHandler(
 	insertStreamKey,
 )
 
-
 var streamHandler = stream.NewHandler(
 	func() *store.Store { return globalStore },
 	func() []byte { return jwtSecret },
@@ -456,6 +455,7 @@ func main() {
 	mux.HandleFunc("/api/uploads/", serveUploadsHandler)
 	mux.HandleFunc("/api/sessions/archive", archiveReplayHandler)
 	mux.HandleFunc("/api/replays", apiReplaysHandler)
+	mux.HandleFunc("/api/replay-file", apiDVRReplayFileHandler)
 	mux.HandleFunc("/api/users", apiUsersHandler)
 	mux.HandleFunc("/health", healthHandler)
 

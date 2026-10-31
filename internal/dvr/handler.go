@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -431,10 +432,10 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	filter := bson.M{
-		// Publish only replays stored in durable Google Drive storage.
-		"replay_url": bson.M{"$regex": `^https://drive\.google\.com/file/d/`},
-	}
+	filter := bson.M{"$or": bson.A{
+		bson.M{"replay_url": bson.M{"$regex": `^https://drive\.google\.com/file/d/`}},
+		bson.M{"replay_url": bson.M{"$regex": `^/record/live/[A-Za-z0-9._-]+\.mp4$`}},
+	}}
 	if streamKey := strings.TrimSpace(r.URL.Query().Get("streamKey")); streamKey != "" {
 		filter["stream_key"] = streamKey
 	}
@@ -490,7 +491,7 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 			StartedAt:       s.StartedAt,
 			EndedAt:         s.EndedAt,
 			DurationSeconds: s.DurationSeconds,
-			ReplayURL:       s.ReplayURL,
+			ReplayURL:       publicReplayURL(s.ReplayURL),
 			DriveFileID:     s.DriveFileID,
 			RecordStatus:    s.RecordStatus,
 			PartIndex:       s.PartIndex,
@@ -499,6 +500,77 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+func publicReplayURL(replayURL string) string {
+	if strings.HasPrefix(replayURL, "/record/live/") && !strings.Contains(replayURL, "..") {
+		return "/api/replay-file?path=" + url.QueryEscape(replayURL)
+	}
+	return replayURL
+}
+
+var srsReplayPathPattern = regexp.MustCompile(`^/record/live/[A-Za-z0-9._-]+\.mp4$`)
+
+// ServeDVRReplay streams a retained SRS DVR file through the API origin so HTTPS
+// frontends can play it without mixed-content requests to the HTTP-only SRS port.
+func (h *Handler) ServeDVRReplay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	replayPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if !srsReplayPathPattern.MatchString(replayPath) || strings.Contains(replayPath, "..") {
+		http.Error(w, "Invalid replay path", http.StatusBadRequest)
+		return
+	}
+
+	baseURL, err := SRSHTTPBaseURL()
+	if err != nil {
+		http.Error(w, "Replay storage is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	targetURL, err := url.Parse(MakeSRSRecordURL(baseURL, replayPath))
+	if err != nil {
+		http.Error(w, "Replay storage is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	upstreamRequest, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), nil)
+	if err != nil {
+		http.Error(w, "Invalid replay request", http.StatusBadRequest)
+		return
+	}
+	for _, header := range []string{"Range", "If-Range"} {
+		if value := r.Header.Get(header); value != "" {
+			upstreamRequest.Header.Set(header, value)
+		}
+	}
+
+	upstreamResponse, err := http.DefaultClient.Do(upstreamRequest)
+	if err != nil {
+		http.Error(w, "Replay storage could not be reached", http.StatusBadGateway)
+		return
+	}
+	defer upstreamResponse.Body.Close()
+
+	for _, header := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"} {
+		if value := upstreamResponse.Header.Get(header); value != "" {
+			w.Header().Set(header, value)
+		}
+	}
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "video/mp4")
+	}
+	if w.Header().Get("Accept-Ranges") == "" {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(upstreamResponse.StatusCode)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, upstreamResponse.Body)
+	}
 }
 
 // ManageSessionReplay cho phép Admin / SystemAdmin gắn link Google Drive hoặc xóa bản ghi xem lại.
