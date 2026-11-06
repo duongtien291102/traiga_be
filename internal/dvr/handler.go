@@ -163,6 +163,11 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 			now := time.Now()
 
+			// Đợi worker FFmpeg trên VPS chuẩn hóa đồng bộ âm thanh - hình ảnh (.avsync-v1)
+			// trước khi công khai bản ghi xem lại và đẩy lên Google Drive để người xem không tải nhầm bản thô bị lệch tiếng.
+			log.Printf("⏳ [SRS DVR] Đang đợi hoàn tất chuẩn hóa âm thanh - hình ảnh cho '%s'...", relativeReplayPath)
+			WaitForDVRNormalization(ctx, vpsRecordURL, 45*time.Second)
+
 			// Tìm tiêu đề của Stream Key
 			roomTitle := fmt.Sprintf("Phiên Live %s", streamKey)
 			streamerName := "Chủ Trại"
@@ -283,9 +288,6 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 					keyPart = "live"
 				}
 				driveFileName := fmt.Sprintf("TraiGa_%s_%s.mp4", keyPart, targetSession.StartedAt.Format("20060102_150405"))
-				log.Printf("⏳ [SRS DVR] Đang đợi hoàn tất chuẩn hóa âm thanh - hình ảnh cho '%s'...", driveFileName)
-				WaitForDVRNormalization(ctx, vpsRecordURL, 45*time.Second)
-
 				log.Printf("☁️ [GOOGLE DRIVE UPLOAD] Đang tải '%s' lên Google Drive...", driveFileName)
 
 				fileID, previewURL, errUp := UploadStreamToGoogleDrive(driveFileName, vpsRecordURL)
