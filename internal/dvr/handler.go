@@ -197,6 +197,18 @@ func (h *Handler) DVR(w http.ResponseWriter, r *http.Request) {
 				},
 			}, opts).Decode(&targetSession)
 
+			if errFind != nil {
+				var uploadedSession model.LiveSession
+				if errUp := st.Sessions.FindOne(ctx, bson.M{
+					"stream_key":    streamKey,
+					"record_status": bson.M{"$in": []string{"uploaded_drive", "uploaded_local"}},
+					"ended_at":      bson.M{"$gte": now.Add(-2 * time.Minute)},
+				}, opts).Decode(&uploadedSession); errUp == nil {
+					log.Printf("ℹ️ [SRS DVR] Phiên %s đã có bản ghi tải lên (%s), bỏ qua tạo bản sao DVR: %s", uploadedSession.ID.Hex(), uploadedSession.RecordStatus, relativeReplayPath)
+					return
+				}
+			}
+
 			// Tự động nhận diện chuỗi phát sóng bị đứt đoạn & nối tiếp do rớt mạng/reconnect
 			// Nếu phiên trước của cùng streamKey vừa kết thúc cách đây dưới 3 phút (thời gian mạng rớt và nối lại),
 			// hệ thống sẽ đánh số Phần 1, Phần 2 để tránh clip ngắn bị rời rạc.
@@ -437,6 +449,7 @@ func (h *Handler) ListReplays(w http.ResponseWriter, r *http.Request) {
 	filter := bson.M{"$or": bson.A{
 		bson.M{"replay_url": bson.M{"$regex": `^https://drive\.google\.com/file/d/`}},
 		bson.M{"replay_url": bson.M{"$regex": `^/record/live/[A-Za-z0-9._-]+\.mp4$`}},
+		bson.M{"replay_url": bson.M{"$regex": `^/api/uploads/[A-Za-z0-9._-]+\.(mp4|webm|mov)$`}},
 	}}
 	if streamKey := strings.TrimSpace(r.URL.Query().Get("streamKey")); streamKey != "" {
 		filter["stream_key"] = streamKey
@@ -823,12 +836,45 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 	case ".mov":
 		contentType = "video/quicktime"
 	}
-	driveFileID, relativeURL, err := UploadReaderToGoogleDrive(savedFileName, contentType, file, header.Size)
-	if err != nil {
-		log.Printf("[REPLAY UPLOAD] Google Drive upload failed for %q: %v", savedFileName, err)
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể lưu video lên Google Drive. Kiểm tra cấu hình Drive rồi thử lại."})
-		return
+	recordStatus := "uploaded_drive"
+	var driveFileID, relativeURL string
+	if DriveAutoUploadConfigured() {
+		var errDrive error
+		driveFileID, relativeURL, errDrive = UploadReaderToGoogleDrive(savedFileName, contentType, file, header.Size)
+		if errDrive != nil {
+			log.Printf("[REPLAY UPLOAD] Google Drive upload failed for %q, falling back to local storage: %v", savedFileName, errDrive)
+		}
+	}
+	if relativeURL == "" {
+		if _, errSeek := file.Seek(0, io.SeekStart); errSeek != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể đọc lại file tải lên để lưu cục bộ"})
+			return
+		}
+		uploadDir := "uploads"
+		if errDir := os.MkdirAll(uploadDir, 0o755); errDir != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể tạo thư mục lưu trữ video trên máy chủ"})
+			return
+		}
+		dstPath := filepath.Join(uploadDir, savedFileName)
+		dstFile, errCreate := os.Create(dstPath)
+		if errCreate != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không thể lưu file video trên máy chủ"})
+			return
+		}
+		if _, errCopy := io.Copy(dstFile, file); errCopy != nil {
+			_ = dstFile.Close()
+			_ = os.Remove(dstPath)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Lỗi khi ghi file video trên máy chủ"})
+			return
+		}
+		_ = dstFile.Close()
+		driveFileID = ""
+		relativeURL = "/api/uploads/" + savedFileName
+		recordStatus = "uploaded_local"
 	}
 	title := strings.TrimSpace(r.FormValue("title"))
 	streamKey := strings.TrimSpace(r.FormValue("stream_key"))
@@ -865,7 +911,11 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 			updateFields := bson.M{
 				"replay_url":    relativeURL,
 				"drive_file_id": driveFileID,
-				"record_status": "uploaded_drive",
+				"record_status": recordStatus,
+			}
+			if targetSession.EndedAt == nil {
+				updateFields["status"] = "ended"
+				updateFields["ended_at"] = now
 			}
 			if title != "" {
 				updateFields["title"] = title
@@ -883,7 +933,7 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 				EndedAt:      &now,
 				ReplayURL:    relativeURL,
 				DriveFileID:  driveFileID,
-				RecordStatus: "uploaded_drive",
+				RecordStatus: recordStatus,
 			}
 			_, _ = st.Sessions.InsertOne(ctx, newSession)
 		}
@@ -891,10 +941,10 @@ func (h *Handler) UploadReplay(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":       "Đã lưu video lên Google Drive",
+		"message":       "Đã lưu video xem lại thành công",
 		"replay_url":    relativeURL,
 		"drive_file_id": driveFileID,
-		"record_status": "uploaded_drive",
+		"record_status": recordStatus,
 		"filename":      savedFileName,
 	})
 }
