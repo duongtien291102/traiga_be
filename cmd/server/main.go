@@ -368,6 +368,11 @@ func toggleKeyHandler(w http.ResponseWriter, r *http.Request) {
 	streamHandler.ToggleKey(w, r)
 }
 
+// regenerateKeyHandler làm mới và tự động sinh Stream Key ngẫu nhiên bảo mật cao cho Admin
+func regenerateKeyHandler(w http.ResponseWriter, r *http.Request) {
+	streamHandler.RegenerateKey(w, r)
+}
+
 // apiSessionsHandler xem lịch sử phiên live (Admin xem của mình, SystemAdmin xem toàn bộ, bảo vệ IP streamer)
 func apiSessionsHandler(w http.ResponseWriter, r *http.Request) {
 	streamHandler.Sessions(w, r)
@@ -449,6 +454,7 @@ func main() {
 	mux.HandleFunc("/api/keys", apiKeysHandler)
 	mux.HandleFunc("/api/keys/secret", revealPublishSecretHandler)
 	mux.HandleFunc("/api/keys/toggle", toggleKeyHandler)
+	mux.HandleFunc("/api/keys/regenerate", regenerateKeyHandler)
 	mux.HandleFunc("/api/sessions", apiSessionsHandler)
 	mux.HandleFunc("/api/sessions/replay", apiSessionReplayManageHandler)
 	mux.HandleFunc("/api/sessions/upload", apiSessionUploadHandler)

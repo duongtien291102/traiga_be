@@ -607,3 +607,34 @@ func TestPhase2_3_CORSAndSecurityHeaders(t *testing.T) {
 		}
 	})
 }
+
+// TestRegenerateKeyHandler_Authorization kiểm tra phân quyền trên POST /api/keys/regenerate
+func TestRegenerateKeyHandler_Authorization(t *testing.T) {
+	// 1. Anonymous -> 401 Unauthorized
+	req := httptest.NewRequest(http.MethodPost, "/api/keys/regenerate", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	regenerateKeyHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected 401 for anonymous, got %d", w.Code)
+	}
+
+	// 2. Normal user -> 403 Forbidden
+	token := createTestToken("user", "normal_user")
+	req2 := httptest.NewRequest(http.MethodPost, "/api/keys/regenerate", strings.NewReader(`{}`))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	w2 := httptest.NewRecorder()
+	regenerateKeyHandler(w2, req2)
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("Expected 403 for normal user, got %d", w2.Code)
+	}
+
+	// 3. GET method not allowed -> 405 Method Not Allowed
+	tokenAdmin := createTestToken("admin", "admin_user")
+	req3 := httptest.NewRequest(http.MethodGet, "/api/keys/regenerate", nil)
+	req3.Header.Set("Authorization", "Bearer "+tokenAdmin)
+	w3 := httptest.NewRecorder()
+	regenerateKeyHandler(w3, req3)
+	if w3.Code != http.StatusMethodNotAllowed {
+		t.Errorf("Expected 405 for GET, got %d", w3.Code)
+	}
+}

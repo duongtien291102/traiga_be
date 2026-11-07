@@ -512,8 +512,12 @@ func (h *Handler) Keys(w http.ResponseWriter, r *http.Request) {
 
 		cleanKey := strings.ToLower(strings.TrimSpace(req.Key))
 		if cleanKey == "" {
-			http.Error(w, `{"error":"Khóa luồng không được để trống"}`, http.StatusBadRequest)
-			return
+			var errGen error
+			cleanKey, errGen = GenerateStreamKey()
+			if errGen != nil {
+				http.Error(w, `{"error":"Lỗi sinh khóa luồng ngẫu nhiên"}`, http.StatusInternalServerError)
+				return
+			}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -825,6 +829,148 @@ func (h *Handler) ToggleKey(w http.ResponseWriter, r *http.Request) {
 		"message":   "Cập nhật trạng thái thành công!",
 		"key":       req.Key,
 		"is_active": req.IsActive,
+	})
+}
+
+// RegenerateKey làm mới và tự động sinh Stream Key ngẫu nhiên bảo mật cao cho Admin
+// POST /api/keys/regenerate
+func (h *Handler) RegenerateKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	claims, err := h.getUser(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Yêu cầu đăng nhập"})
+		return
+	}
+	if claims.Role != "admin" && claims.Role != "systemadmin" {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Chỉ Quản trị viên (Admin hoặc SystemAdmin) mới có quyền tạo lại Key"})
+		return
+	}
+
+	limiter.LimitRequestBody(w, r, limiter.SmallJSONMaxBodyBytes)
+	var req struct {
+		Key string `json:"key"`
+		ID  string `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	st := h.GetStore()
+	if st == nil || st.Keys == nil {
+		http.Error(w, `{"error":"Cơ sở dữ liệu chưa sẵn sàng"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	var targetKey model.StreamKey
+	found := false
+
+	if strings.TrimSpace(req.ID) != "" {
+		if objID, errID := primitive.ObjectIDFromHex(strings.TrimSpace(req.ID)); errID == nil {
+			if errFind := st.Keys.FindOne(ctx, bson.M{"_id": objID}).Decode(&targetKey); errFind == nil {
+				found = true
+			}
+		}
+	}
+
+	if !found && strings.TrimSpace(req.Key) != "" {
+		if errFind := st.Keys.FindOne(ctx, bson.M{"key": strings.TrimSpace(req.Key)}).Decode(&targetKey); errFind == nil {
+			found = true
+		}
+	}
+
+	if !found {
+		// Tìm theo người dùng hiện tại
+		var filter bson.M
+		callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
+		if errID == nil {
+			filter = bson.M{
+				"$or": []bson.M{
+					{"user_id": callerObjID},
+					{"streamer": claims.Username},
+				},
+			}
+		} else {
+			filter = bson.M{"streamer": claims.Username}
+		}
+		if errFind := st.Keys.FindOne(ctx, filter).Decode(&targetKey); errFind == nil {
+			found = true
+		}
+	}
+
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Không tìm thấy Stream Key để làm mới"})
+		return
+	}
+
+	// Kiểm tra quyền sở hữu nếu không phải systemadmin
+	if claims.Role != "systemadmin" {
+		callerObjID, errID := primitive.ObjectIDFromHex(claims.UserID)
+		ownsKey := errID == nil && targetKey.UserID != nil && *targetKey.UserID == callerObjID
+		if !ownsKey && targetKey.UserID == nil {
+			ownsKey = strings.EqualFold(targetKey.Streamer, claims.Username)
+		}
+		if !ownsKey {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Quyền truy cập bị từ chối: Bạn không sở hữu Stream Key này"})
+			return
+		}
+	}
+
+	// Sinh Stream Key ngẫu nhiên bảo mật cao (64 ký tự hex)
+	newKey, err := GenerateStreamKey()
+	if err != nil {
+		http.Error(w, `{"error":"Lỗi sinh Stream Key mới"}`, http.StatusInternalServerError)
+		return
+	}
+
+	oldKey := targetKey.Key
+	targetKey.Key = newKey
+	targetKey.PublishSecret = ""
+	targetKey.PublishSecretEncrypted = ""
+	targetKey.PublishSecretHash = ""
+
+	if h.StreamKeyForStorage != nil {
+		storedKey, errStorage := h.StreamKeyForStorage(targetKey)
+		if errStorage != nil {
+			http.Error(w, `{"error":"Lỗi mã hóa publish secret"}`, http.StatusInternalServerError)
+			return
+		}
+		targetKey = storedKey
+	}
+
+	updateFields := bson.M{
+		"key":                 targetKey.Key,
+		"publish_secret_enc":  targetKey.PublishSecretEncrypted,
+		"publish_secret_hash": targetKey.PublishSecretHash,
+	}
+	if _, err := st.Keys.UpdateOne(ctx, bson.M{"_id": targetKey.ID}, bson.M{"$set": updateFields}); err != nil {
+		http.Error(w, `{"error":"Lỗi lưu Stream Key mới vào cơ sở dữ liệu"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if st.RoomBots != nil && oldKey != "" {
+		_, _ = st.RoomBots.UpdateMany(ctx, bson.M{"stream_key": oldKey}, bson.M{"$set": bson.M{"stream_key": newKey}})
+	}
+
+	if h.RecordAccessLog != nil {
+		h.RecordAccessLog(claims.Username, claims.Role, "regenerate_stream_key", limiter.GetClientIP(r),
+			fmt.Sprintf("Làm mới Stream Key từ '%s' sang '%s'", oldKey, newKey))
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":        "Đã làm mới Stream Key thành công!",
+		"key":            targetKey.Key,
+		"old_key":        oldKey,
+		"publish_secret": targetKey.PublishSecret,
 	})
 }
 
